@@ -133,6 +133,17 @@ CREATE TABLE IF NOT EXISTS narrative_events (
     created_at TEXT,
     metadata TEXT
 );
+
+CREATE TABLE IF NOT EXISTS operator_commands (
+    id TEXT PRIMARY KEY,
+    mode TEXT,                -- "observe" | "influence"
+    question TEXT,
+    instruction TEXT,
+    status TEXT,              -- "pending" | "done"
+    created_at TEXT,
+    applied_at TEXT,
+    response TEXT
+);
 """
 
 
@@ -240,6 +251,38 @@ class HistoryDB:
         await self._db.commit()
         return row_id
 
+    async def add_operator_command(
+        self,
+        mode: str,
+        question: str,
+        instruction: str = "",
+    ) -> str:
+        row_id = str(uuid.uuid4())
+        await self._db.execute(
+            "INSERT INTO operator_commands (id, mode, question, instruction, status, created_at, applied_at, response) "
+            "VALUES (?, ?, ?, ?, 'pending', ?, '', '')",
+            (row_id, mode, question, instruction, _now_iso()),
+        )
+        await self._db.commit()
+        return row_id
+
+    async def get_pending_operator_command(self) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT * FROM operator_commands WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+    async def complete_operator_command(self, command_id: str, response: str = "") -> None:
+        await self._db.execute(
+            "UPDATE operator_commands SET status = 'done', applied_at = ?, response = ? WHERE id = ?",
+            (_now_iso(), response, command_id),
+        )
+        await self._db.commit()
+
     # ── Queries ─────────────────────────────────────────────────
 
     async def get_recent_posts(self, limit: int = 10) -> list[dict]:
@@ -267,3 +310,19 @@ class HistoryDB:
         cursor = await self._db.execute("SELECT COUNT(*) FROM comments")
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    async def get_recent_narrative_events(self, limit: int = 10) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM narrative_events ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        cols = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def get_recent_operator_commands(self, limit: int = 10) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM operator_commands ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        cols = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]

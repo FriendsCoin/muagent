@@ -35,6 +35,7 @@ def load_config(
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "runware_api_key": os.getenv("RUNWARE_API_KEY", ""),
         "comfyui_api_key": os.getenv("COMFYUI_API_KEY", ""),
+        "admin_token": os.getenv("ADMIN_TOKEN", ""),
     }
 
     return cfg

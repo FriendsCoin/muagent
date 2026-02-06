@@ -221,6 +221,7 @@ class Personality:
         day: int = 1,
         total_posts: int = 0,
         mode_hint: str = "",
+        context: str = "",
     ) -> str:
         """Generate a response to another agent's post."""
         mode = self._pick_mode(
@@ -233,6 +234,7 @@ class Personality:
             f"Post by {post_author}: \"{post_title}\"\n"
             f"Post content: \"{post_content[:500]}\"\n"
             f"Desired tone: {tone}\n"
+            f"Operator context: {context or 'none'}\n"
             f"Voice mode: {mode}\n"
             "Keep it short - 1-3 sentences. Be the trickster, not a commenter.\n"
             "Just output the comment text, nothing else."

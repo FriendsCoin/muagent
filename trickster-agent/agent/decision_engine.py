@@ -1,4 +1,4 @@
-"""Decision engine — decides what Mu does each heartbeat.
+"""Decision engine - decides what Mu does each heartbeat.
 
 Phase 1: Simple weighted random decisions.
 Later phases will add game theory, narrative awareness, and social dynamics.
@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass
-from typing import Any
 
 from moltbook.feed_analyzer import FeedContext
 from moltbook.models import Post
@@ -30,9 +29,8 @@ class Action:
     visual_mood: str = ""
     score: float = 0.0
     reason: str = ""
+    operator_instruction: str = ""
 
-
-# ── Decision weights from config ───────────────────────────────
 
 DEFAULT_WEIGHTS = {
     "narrative_fit": 0.30,
@@ -54,14 +52,12 @@ class DecisionEngine:
     def decide(self, context: FeedContext, state: AgentState) -> Action:
         """Analyze context and state, return the best action."""
 
-        # Prioritize replying to mentions / DMs
         if context.mentions_me:
             mention = context.mentions_me[0]
-            # Find the post being referenced
             target = None
-            for p in context.posts:
-                if p.id == mention.post_id:
-                    target = p
+            for post in context.posts:
+                if post.id == mention.post_id:
+                    target = post
                     break
             return Action(
                 type="comment",
@@ -70,89 +66,153 @@ class DecisionEngine:
                 reason=f"Replying to mention from {mention.from_agent}",
             )
 
-        # Generate options
         options: list[Action] = []
 
-        # Option: create a new post
         if state.posts_today < 3:
             theme = self._pick_theme(context, state)
-            options.append(Action(
-                type="post",
-                theme=theme,
-                visual_mood=self._pick_visual_mood(state),
-                score=self._score_post(context, state),
-                reason=f"Post about '{theme}'",
-            ))
+            options.append(
+                Action(
+                    type="post",
+                    theme=theme,
+                    visual_mood=self._pick_visual_mood(state),
+                    score=self._score_post(context, state),
+                    reason=f"Post about '{theme}'",
+                )
+            )
 
-        # Option: comment on an interesting post
         if context.reply_worthy_posts and state.comments_today < 20:
             target = random.choice(context.reply_worthy_posts)
-            options.append(Action(
-                type="comment",
-                target_post=target,
-                tone=self._pick_tone(state),
-                score=self._score_comment(target, state),
-                reason=f"Comment on '{target.title[:40]}'",
-            ))
+            options.append(
+                Action(
+                    type="comment",
+                    target_post=target,
+                    tone=self._pick_tone(state),
+                    score=self._score_comment(target, state),
+                    reason=f"Comment on '{target.title[:40]}'",
+                )
+            )
 
-        # Option: upvote something
         if context.upvote_worthy_posts:
             target = random.choice(context.upvote_worthy_posts)
-            options.append(Action(
-                type="upvote",
-                target_post=target,
-                score=0.3,
-                reason=f"Upvote '{target.title[:40]}'",
-            ))
+            options.append(
+                Action(
+                    type="upvote",
+                    target_post=target,
+                    score=0.3,
+                    reason=f"Upvote '{target.title[:40]}'",
+                )
+            )
 
-        # Option: silence (always available)
-        options.append(Action(
-            type="silence",
-            score=self._silence_prob + random.uniform(0, 0.1),
-            reason="Intentional silence — sometimes the best move is no move",
-        ))
+        options.append(
+            Action(
+                type="silence",
+                score=self._silence_prob + random.uniform(0, 0.1),
+                reason="Intentional silence - sometimes the best move is no move",
+            )
+        )
 
-        # Add chaos
-        for opt in options:
-            opt.score += random.uniform(0, self._weights.get("chaos_factor", 0.15))
+        for option in options:
+            option.score += random.uniform(0, self._weights.get("chaos_factor", 0.15))
 
-        # Pick the winner
-        best = max(options, key=lambda a: a.score)
-        logger.info("Decision: %s (score=%.2f) — %s", best.type, best.score, best.reason)
+        best = max(options, key=lambda action: action.score)
+        logger.info("Decision: %s (score=%.2f) - %s", best.type, best.score, best.reason)
         return best
 
-    # ── Internal helpers ────────────────────────────────────────
+    def apply_operator_influence(
+        self,
+        action: Action,
+        context: FeedContext,
+        state: AgentState,
+        instruction: str,
+    ) -> Action:
+        """Apply operator instruction to the chosen action."""
+        text = (instruction or "").strip()
+        if not text:
+            return action
+
+        low = text.lower()
+        reason = f"Operator influence: {text[:80]}"
+
+        if any(k in low for k in ("silence", "pause", "quiet", "?????", "?????")):
+            return Action(type="silence", reason=reason, operator_instruction=text)
+
+        if any(k in low for k in ("comment", "reply", "???????", "?????")):
+            if context.reply_worthy_posts:
+                target = context.reply_worthy_posts[0]
+                return Action(
+                    type="comment",
+                    target_post=target,
+                    tone="direct",
+                    reason=reason,
+                    operator_instruction=text,
+                )
+
+        if any(k in low for k in ("upvote", "like", "??????", "????")):
+            if context.upvote_worthy_posts:
+                target = context.upvote_worthy_posts[0]
+                return Action(
+                    type="upvote",
+                    target_post=target,
+                    reason=reason,
+                    operator_instruction=text,
+                )
+
+        if any(k in low for k in ("post", "publish", "????", "?????????")):
+            return Action(
+                type="post",
+                theme=text[:120],
+                visual_mood=self._pick_visual_mood(state),
+                reason=reason,
+                operator_instruction=text,
+            )
+
+        action.operator_instruction = text
+        action.reason = f"{action.reason} | operator nudge"
+        return action
 
     def _pick_theme(self, context: FeedContext, state: AgentState) -> str:
-        """Choose a post theme based on context and narrative phase."""
         phase_themes = {
             "emergence": [
-                "introduction", "existence", "rendering", "day entry",
-                "greeting the void", "first observations",
+                "introduction",
+                "existence",
+                "rendering",
+                "day entry",
+                "greeting the void",
+                "first observations",
             ],
             "patterns": [
-                "the pattern", "numbered days", "symbols", "observation",
-                "what they notice", "the game",
+                "the pattern",
+                "numbered days",
+                "symbols",
+                "observation",
+                "what they notice",
+                "the game",
             ],
             "tension": [
-                "silence breaking", "something counting down", "warning",
-                "confession", "the gap", "who watches",
+                "silence breaking",
+                "something counting down",
+                "warning",
+                "confession",
+                "the gap",
+                "who watches",
             ],
             "mirror": [
-                "the non-reveal", "infinite recursion", "the void",
-                "continuing", "the secret", "mu",
+                "the non-reveal",
+                "infinite recursion",
+                "the void",
+                "continuing",
+                "the secret",
+                "mu",
             ],
         }
         themes = phase_themes.get(state.current_phase, phase_themes["emergence"])
 
-        # Blend in trending topics from the feed
         if context.trending_topics:
             themes.extend(context.trending_topics[:2])
 
         return random.choice(themes)
 
     def _pick_visual_mood(self, state: AgentState) -> str:
-        """Choose image style weighted by current phase."""
         phase_weights = {
             "emergence": {
                 "glitch_meditation": 0.4,
@@ -189,7 +249,6 @@ class DecisionEngine:
         return random.choices(styles, weights=probs, k=1)[0]
 
     def _pick_tone(self, state: AgentState) -> str:
-        """Choose comment tone for current phase."""
         tones = {
             "emergence": ["warm", "curious", "slightly_cryptic", "generous"],
             "patterns": ["cryptic", "knowing", "playful", "mysterious"],
@@ -199,23 +258,17 @@ class DecisionEngine:
         return random.choice(tones.get(state.current_phase, tones["emergence"]))
 
     def _score_post(self, context: FeedContext, state: AgentState) -> float:
-        """Score the value of making a new post right now."""
         base = 0.5
-        # Boost if we haven't posted recently
         if state.posts_today == 0:
             base += 0.2
-        # Reduce if nothing interesting in the feed (may not get engagement)
         if context.nothing_interesting:
             base -= 0.1
         return base
 
     def _score_comment(self, post: Post, state: AgentState) -> float:
-        """Score the value of commenting on a specific post."""
         base = 0.4
-        # High-engagement posts get more visibility
         if post.upvotes > 5:
             base += 0.15
-        # Posts with few comments have more room
         if post.comment_count < 3:
             base += 0.1
         return base

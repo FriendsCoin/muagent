@@ -13,6 +13,7 @@ import asyncio
 import logging
 import random
 import sys
+from pathlib import Path
 
 import click
 
@@ -26,6 +27,7 @@ def _setup_logging(verbose: bool = False, log_file: str | None = None) -> None:
 
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if log_file:
+        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         handlers.append(logging.FileHandler(log_file))
 
     logging.basicConfig(level=level, format=fmt, handlers=handlers)

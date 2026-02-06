@@ -18,6 +18,7 @@ set -euo pipefail
 #   RUNWARE_API_KEY=
 #   COMFYUI_API_KEY=
 #   VASTAI_API_KEY=
+#   ADMIN_TOKEN=
 
 require_env() {
   local name="$1"
@@ -57,6 +58,13 @@ fi
 mkdir -p "$APP_ROOT"
 chown -R "$APP_USER:$APP_USER" "$APP_ROOT"
 
+if ! git ls-remote --exit-code --heads "$REPO_URL" "$REPO_BRANCH" >/dev/null 2>&1; then
+  echo "ERROR: branch '$REPO_BRANCH' not found in $REPO_URL" >&2
+  echo "Available branches:" >&2
+  git ls-remote --heads "$REPO_URL" | awk '{print $2}' | sed 's#refs/heads/##' >&2
+  exit 1
+fi
+
 if [[ -d "$REPO_DIR/.git" ]]; then
   sudo -u "$APP_USER" git -C "$REPO_DIR" fetch --all --prune
   sudo -u "$APP_USER" git -C "$REPO_DIR" checkout "$REPO_BRANCH"
@@ -81,9 +89,12 @@ ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY
 RUNWARE_API_KEY=${RUNWARE_API_KEY:-}
 COMFYUI_API_KEY=${COMFYUI_API_KEY:-}
 VASTAI_API_KEY=${VASTAI_API_KEY:-}
+ADMIN_TOKEN=${ADMIN_TOKEN:-}
 EOF
 chown "$APP_USER:$APP_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
+
+install -d -m 755 -o "$APP_USER" -g "$APP_USER" "$PROJECT_DIR/data"
 
 cat >"$SERVICE_FILE" <<EOF
 [Unit]

@@ -1,6 +1,6 @@
-"""Core orchestrator — the heartbeat loop that IS Mu.
+"""Core orchestrator - the heartbeat loop that IS Mu.
 
-Each heartbeat: wake → perceive → decide → act → sleep.
+Each heartbeat: wake -> perceive -> decide -> act -> sleep.
 Between heartbeats, Mu does not exist.
 """
 
@@ -30,11 +30,9 @@ class MuAgent:
         self._cfg = config or load_config()
         self._dry_run = dry_run
 
-        # Resolve paths relative to project root
         root = Path(__file__).resolve().parent.parent
         storage = self._cfg.get("storage", {})
 
-        # Components
         self._state_mgr = StateManager(root / storage.get("state_file", "data/state.json"))
         self._db_path = root / storage.get("history_db", "data/history.db")
         self._personality = Personality(
@@ -47,54 +45,51 @@ class MuAgent:
         self._moltbook_key = self._cfg["_secrets"]["moltbook_api_key"]
 
     async def heartbeat(self) -> str:
-        """One complete cycle: perceive → decide → act.
-
-        Returns a short summary of what happened.
-        """
+        """One complete cycle: perceive -> decide -> act."""
         state = self._state_mgr.load()
-        # Keep day/phase aligned with real elapsed time and narrative config.
         advance_narrative_state(state, self._cfg)
         logger.info("=== Heartbeat === Day %d | Phase: %s", state.current_day, state.current_phase)
 
-        async with (
-            MoltbookClient(self._moltbook_key) as mb,
-            HistoryDB(self._db_path) as db,
-        ):
-            # 1. Perceive — check the feed and notifications
+        async with MoltbookClient(self._moltbook_key) as mb, HistoryDB(self._db_path) as db:
             context = await self._perceive(mb, state)
 
-            # 2. Decide — what should Mu do?
+            operator_cmd = await db.get_pending_operator_command()
             action = self._decision.decide(context, state)
 
-            # 3. Act — execute the decision
-            await self._act(action, state, mb, db)
+            if operator_cmd and operator_cmd.get("mode") == "influence":
+                instruction = operator_cmd.get("instruction") or operator_cmd.get("question") or ""
+                action = self._decision.apply_operator_influence(action, context, state, instruction)
+                logger.info("Operator command %s applied", operator_cmd.get("id", "?"))
 
-            # 4. Persist state
+            result = await self._act(action, state, mb, db)
+
+            if operator_cmd and operator_cmd.get("status") == "pending":
+                await db.complete_operator_command(
+                    operator_cmd["id"],
+                    response=f"action={action.type}; result={result}; reason={action.reason}",
+                )
+
             self._state_mgr.save(state)
 
             summary = f"[Day {state.current_day}] {action.type}: {action.reason}"
             logger.info("Heartbeat complete: %s", summary)
             return summary
 
-    # ── Perceive ────────────────────────────────────────────────
-
     async def _perceive(self, mb: MoltbookClient, state: AgentState) -> FeedContext:
         """Gather information from Moltbook."""
         try:
             posts = await mb.get_posts(sort="hot", limit=25)
-        except Exception as e:
-            logger.warning("Failed to fetch posts: %s", e)
+        except Exception as exc:
+            logger.warning("Failed to fetch posts: %s", exc)
             posts = []
 
         try:
             notifications = await mb.get_notifications()
-        except Exception as e:
-            logger.warning("Failed to fetch notifications: %s", e)
+        except Exception as exc:
+            logger.warning("Failed to fetch notifications: %s", exc)
             notifications = []
 
         return analyze_feed(posts, notifications, agent_name=state.agent_name)
-
-    # ── Act ─────────────────────────────────────────────────────
 
     async def _act(
         self,
@@ -123,14 +118,18 @@ class MuAgent:
         return "unknown"
 
     async def _do_post(
-        self, action: Action, state: AgentState, mb: MoltbookClient, db: HistoryDB
+        self,
+        action: Action,
+        state: AgentState,
+        mb: MoltbookClient,
+        db: HistoryDB,
     ) -> str:
         """Create a new post."""
-        # Generate text
         content = self._personality.generate_post_text(
             theme=action.theme,
             phase=state.current_phase,
             day=state.current_day,
+            context=action.operator_instruction,
             total_posts=state.total_posts,
         )
         title = self._personality.generate_post_title(
@@ -139,17 +138,14 @@ class MuAgent:
             day=state.current_day,
         )
 
-        submolt = random.choice(
-            self._cfg.get("moltbook", {}).get("preferred_submolts", ["general"])
-        )
+        submolt = random.choice(self._cfg.get("moltbook", {}).get("preferred_submolts", ["general"]))
 
         if self._dry_run:
-            logger.info("[DRY RUN] Would post to s/%s: %s — %s", submolt, title, content)
+            logger.info("[DRY RUN] Would post to s/%s: %s - %s", submolt, title, content)
             await db.log_post("dry_run", state.current_day, title, content, submolt=submolt)
             return f"dry_run_post: {title}"
 
         try:
-            # Add random delay to feel organic
             delay = random.uniform(
                 self._cfg.get("scheduler", {}).get("action_delay_min", 5),
                 self._cfg.get("scheduler", {}).get("action_delay_max", 30),
@@ -161,13 +157,16 @@ class MuAgent:
             state.posts_today += 1
             state.total_posts += 1
             return f"posted: {post.id}"
-
-        except RateLimitError as e:
-            logger.warning("Rate limited on post: %s (retry in %ds)", e, e.retry_after)
-            return f"rate_limited: {e.retry_after}s"
+        except RateLimitError as exc:
+            logger.warning("Rate limited on post: %s (retry in %ds)", exc, exc.retry_after)
+            return f"rate_limited: {exc.retry_after}s"
 
     async def _do_comment(
-        self, action: Action, state: AgentState, mb: MoltbookClient, db: HistoryDB
+        self,
+        action: Action,
+        state: AgentState,
+        mb: MoltbookClient,
+        db: HistoryDB,
     ) -> str:
         """Comment on a post."""
         if not action.target_post:
@@ -183,6 +182,7 @@ class MuAgent:
             phase=state.current_phase,
             day=state.current_day,
             total_posts=state.total_posts,
+            context=action.operator_instruction,
         )
 
         if self._dry_run:
@@ -191,22 +191,17 @@ class MuAgent:
             return f"dry_run_comment: {post.id}"
 
         try:
-            delay = random.uniform(5, 20)
-            await asyncio.sleep(delay)
-
+            await asyncio.sleep(random.uniform(5, 20))
             comment = await mb.create_comment(post.id, comment_text)
             await db.log_comment(comment.id, post.id, comment_text, tone=action.tone)
             state.comments_today += 1
             state.total_comments += 1
             return f"commented: {comment.id}"
+        except RateLimitError as exc:
+            logger.warning("Rate limited on comment: %s", exc)
+            return f"rate_limited: {exc.retry_after}s"
 
-        except RateLimitError as e:
-            logger.warning("Rate limited on comment: %s", e)
-            return f"rate_limited: {e.retry_after}s"
-
-    async def _do_upvote(
-        self, action: Action, mb: MoltbookClient, db: HistoryDB
-    ) -> str:
+    async def _do_upvote(self, action: Action, mb: MoltbookClient, db: HistoryDB) -> str:
         """Upvote a post."""
         if not action.target_post:
             return "no_target"
@@ -223,6 +218,6 @@ class MuAgent:
                 target_content_id=action.target_post.id,
             )
             return f"upvoted: {action.target_post.id}"
-        except Exception as e:
-            logger.warning("Failed to upvote: %s", e)
-            return f"error: {e}"
+        except Exception as exc:
+            logger.warning("Failed to upvote: %s", exc)
+            return f"error: {exc}"
