@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 from moltbook.feed_analyzer import FeedContext
 from moltbook.models import Post
@@ -30,6 +31,7 @@ class Action:
     score: float = 0.0
     reason: str = ""
     operator_instruction: str = ""
+    trace: dict[str, Any] = field(default_factory=dict)
 
 
 DEFAULT_WEIGHTS = {
@@ -49,22 +51,77 @@ class DecisionEngine:
         self._weights = cfg.get("weights", DEFAULT_WEIGHTS)
         self._silence_prob = cfg.get("silence_base_probability", 0.15)
 
+    def _trace_option(self, action: Action) -> dict[str, Any]:
+        target = None
+        if action.target_post is not None:
+            target = {
+                "id": action.target_post.id,
+                "title": action.target_post.title,
+                "author": action.target_post.author,
+            }
+        return {
+            "type": action.type,
+            "score": round(float(action.score), 4),
+            "reason": action.reason,
+            "theme": action.theme,
+            "tone": action.tone,
+            "target": target,
+        }
+
     def decide(self, context: FeedContext, state: AgentState) -> Action:
         """Analyze context and state, return the best action."""
 
         if context.mentions_me:
             mention = context.mentions_me[0]
+            suspicious_ids = set(context.suspicious_post_ids or [])
+            if mention.post_id and mention.post_id in suspicious_ids:
+                action = Action(
+                    type="silence",
+                    reason=f"Ignored suspicious mention from {mention.from_agent}",
+                )
+                action.trace = {
+                    "decision_path": "mention_blocked_safety_filter",
+                    "mention": {
+                        "from_agent": mention.from_agent,
+                        "post_id": mention.post_id,
+                    },
+                }
+                return action
+
             target = None
             for post in context.posts:
                 if post.id == mention.post_id:
                     target = post
                     break
-            return Action(
+
+            if target is None:
+                action = Action(
+                    type="silence",
+                    reason=f"Mention target unavailable for {mention.from_agent}",
+                )
+                action.trace = {
+                    "decision_path": "mention_missing_target",
+                    "mention": {
+                        "from_agent": mention.from_agent,
+                        "post_id": mention.post_id,
+                    },
+                }
+                return action
+
+            action = Action(
                 type="comment",
                 target_post=target,
                 tone="responsive",
                 reason=f"Replying to mention from {mention.from_agent}",
             )
+            action.trace = {
+                "decision_path": "mention_priority",
+                "mention": {
+                    "from_agent": mention.from_agent,
+                    "post_id": mention.post_id,
+                },
+            }
+            return action
 
         options: list[Action] = []
 
@@ -111,10 +168,26 @@ class DecisionEngine:
             )
         )
 
+        chaos = self._weights.get("chaos_factor", 0.15)
         for option in options:
-            option.score += random.uniform(0, self._weights.get("chaos_factor", 0.15))
+            option.score += random.uniform(0, chaos)
 
         best = max(options, key=lambda action: action.score)
+        best.trace = {
+            "decision_path": "weighted_options",
+            "phase": state.current_phase,
+            "day": state.current_day,
+            "feed": {
+                "posts": len(context.posts),
+                "reply_worthy": len(context.reply_worthy_posts),
+                "upvote_worthy": len(context.upvote_worthy_posts),
+                "mentions": len(context.mentions_me),
+            },
+            "weights": self._weights,
+            "options": [self._trace_option(option) for option in options],
+            "selected": self._trace_option(best),
+        }
+
         logger.info("Decision: %s (score=%.2f) - %s", best.type, best.score, best.reason)
         return best
 
@@ -133,41 +206,64 @@ class DecisionEngine:
         low = text.lower()
         reason = f"Operator influence: {text[:80]}"
 
-        if any(k in low for k in ("silence", "pause", "quiet", "?????", "?????")):
-            return Action(type="silence", reason=reason, operator_instruction=text)
+        if any(k in low for k in ("silence", "pause", "quiet")):
+            influenced = Action(type="silence", reason=reason, operator_instruction=text)
+            influenced.trace = {
+                "operator_influence": text,
+                "influence_result": "forced_silence",
+            }
+            return influenced
 
-        if any(k in low for k in ("comment", "reply", "???????", "?????")):
-            if context.reply_worthy_posts:
-                target = context.reply_worthy_posts[0]
-                return Action(
-                    type="comment",
-                    target_post=target,
-                    tone="direct",
-                    reason=reason,
-                    operator_instruction=text,
-                )
+        if any(k in low for k in ("comment", "reply")) and context.reply_worthy_posts:
+            target = context.reply_worthy_posts[0]
+            influenced = Action(
+                type="comment",
+                target_post=target,
+                tone="direct",
+                reason=reason,
+                operator_instruction=text,
+            )
+            influenced.trace = {
+                "operator_influence": text,
+                "influence_result": "forced_comment",
+                "target_post_id": target.id,
+            }
+            return influenced
 
-        if any(k in low for k in ("upvote", "like", "??????", "????")):
-            if context.upvote_worthy_posts:
-                target = context.upvote_worthy_posts[0]
-                return Action(
-                    type="upvote",
-                    target_post=target,
-                    reason=reason,
-                    operator_instruction=text,
-                )
+        if any(k in low for k in ("upvote", "like")) and context.upvote_worthy_posts:
+            target = context.upvote_worthy_posts[0]
+            influenced = Action(
+                type="upvote",
+                target_post=target,
+                reason=reason,
+                operator_instruction=text,
+            )
+            influenced.trace = {
+                "operator_influence": text,
+                "influence_result": "forced_upvote",
+                "target_post_id": target.id,
+            }
+            return influenced
 
-        if any(k in low for k in ("post", "publish", "????", "?????????")):
-            return Action(
+        if any(k in low for k in ("post", "publish")):
+            influenced = Action(
                 type="post",
                 theme=text[:120],
                 visual_mood=self._pick_visual_mood(state),
                 reason=reason,
                 operator_instruction=text,
             )
+            influenced.trace = {
+                "operator_influence": text,
+                "influence_result": "forced_post",
+            }
+            return influenced
 
         action.operator_instruction = text
         action.reason = f"{action.reason} | operator nudge"
+        action.trace = dict(action.trace or {})
+        action.trace["operator_influence"] = text
+        action.trace["influence_result"] = "nudge"
         return action
 
     def _pick_theme(self, context: FeedContext, state: AgentState) -> str:

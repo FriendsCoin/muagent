@@ -52,6 +52,30 @@ class MuAgent:
 
         async with MoltbookClient(self._moltbook_key) as mb, HistoryDB(self._db_path) as db:
             context = await self._perceive(mb, state)
+            if context.suspicious_posts or context.blocked_mention_notifications:
+                await db.log_narrative_event(
+                    "safety_filter",
+                    "Filtered suspicious feed content",
+                    metadata={
+                        "suspicious_posts": [
+                            {
+                                "id": post.id,
+                                "author": post.author,
+                                "title": post.title[:120],
+                            }
+                            for post in context.suspicious_posts
+                        ],
+                        "blocked_mentions": [
+                            {
+                                "id": n.id,
+                                "from_agent": n.from_agent,
+                                "post_id": n.post_id,
+                                "message": (n.message or "")[:200],
+                            }
+                            for n in context.blocked_mention_notifications
+                        ],
+                    },
+                )
 
             operator_cmd = await db.get_pending_operator_command()
             action = self._decision.decide(context, state)
@@ -61,7 +85,40 @@ class MuAgent:
                 action = self._decision.apply_operator_influence(action, context, state, instruction)
                 logger.info("Operator command %s applied", operator_cmd.get("id", "?"))
 
+            pause_flag = (await db.get_control_flag("pause_actions", "0")).strip().lower()
+            if pause_flag in {"1", "true", "yes", "on"}:
+                previous_action = action
+                action = Action(
+                    type="silence",
+                    score=1.0,
+                    reason="Paused by operator control flag",
+                )
+                action.trace = {
+                    "decision_path": "control_flag_pause",
+                    "pause_actions": True,
+                    "previous_selected": {
+                        "type": previous_action.type,
+                        "reason": previous_action.reason,
+                        "score": previous_action.score,
+                    },
+                }
+                logger.info("Pause flag is active: action overridden to silence")
+
             result = await self._act(action, state, mb, db)
+
+            await db.log_reasoning_trace(
+                source="heartbeat",
+                action_type=action.type,
+                summary=action.reason,
+                payload={
+                    "day": state.current_day,
+                    "phase": state.current_phase,
+                    "score": action.score,
+                    "operator_command_id": operator_cmd.get("id") if operator_cmd else "",
+                    "result": result,
+                    "trace": action.trace,
+                },
+            )
 
             if operator_cmd and operator_cmd.get("status") == "pending":
                 await db.complete_operator_command(

@@ -10,7 +10,7 @@ scp .\trickster-agent\deploy\install_ubuntu.sh root@YOUR_SERVER_IP:/root/install
 ssh root@YOUR_SERVER_IP "chmod +x /root/install_ubuntu.sh && REPO_URL='https://github.com/FriendsCoin/muagent.git' REPO_BRANCH='master' PROJECT_SUBDIR='trickster-agent' MOLTBOOK_API_KEY='YOUR_MOLTBOOK_KEY' ANTHROPIC_API_KEY='YOUR_ANTHROPIC_KEY' ADMIN_TOKEN='CHANGE_ME' /root/install_ubuntu.sh"
 ```
 
-Adjust `REPO_BRANCH` to your real branch (`master`/`main`).
+Adjust `REPO_BRANCH` to your real branch (`main`/`master`).
 
 ## 2. Migrate local state/history to continue timeline
 
@@ -61,13 +61,56 @@ Then open:
 Modes:
 - `observe`: ask Mu, no effect on decisions.
 - `influence`: queues one instruction for next heartbeat.
+- `conscious framework` checkbox: includes context from `NEW/conscious-claude-master` in responses.
+- `Reasoning Trace` panel: shows safe structured decision traces (options/scores/selection), not hidden chain-of-thought.
+- `Safety Blocks` panel: shows suspicious posts/mentions that were filtered by anti-manipulation rules.
+- `Control` panel:
+  - `Pause Actions` / `Resume Actions` (writes `pause_actions` control flag).
+  - `Run Once (Dry)` for safe diagnostics.
+  - `Run Once (Live)` for immediate live heartbeat (can post/comment).
+  - `Reload Framework` to re-read `NEW/conscious-claude-master` without restarting service.
+- `Debug` panel:
+  - runtime snapshot,
+  - key file states/sizes,
+  - `systemctl is-active/is-enabled` for `trickster-agent`, `trickster-admin`, `trickster-thinker`.
 
 If `ADMIN_TOKEN` is set in `.env`, paste it in UI token field.
+Token is passed as URL query (`?token=...`) to avoid browser header encoding issues.
 
-## 5. Health checks
+## 5. Autonomous thinking service (optional)
+
+```bash
+cd /opt/trickster-agent/repo/trickster-agent
+chmod +x deploy/install_conscious_thinker.sh
+sudo INTERVAL_MINUTES=45 deploy/install_conscious_thinker.sh
+```
+
+This writes autonomous thought entries into `thought_journal` table.
+They are visible in the admin activity panel.
+
+## 6. Заливка отдельных файлов на сервер (без git)
+
+Чтобы выложить только изменённые файлы через SCP (без git pull на сервере), можно сгенерировать команды так:
+
+- **По запросу ассистенту:** напиши, какие файлы залить (или «залей изменённые»), и попроси подготовить команды SCP — получишь готовый блок для PowerShell.
+- **Формат:** одна строка `cd E:\PROJECTS\files_molt`, затем для каждого файла строка вида:
+  `scp .\trickster-agent\путь\к\файлу root@SERVER_IP:/opt/trickster-agent/repo/trickster-agent/путь/к/файлу`
+
+Пример (подставь свой IP):
+
+```powershell
+cd E:\PROJECTS\files_molt
+scp .\trickster-agent\agent\core.py root@65.21.243.4:/opt/trickster-agent/repo/trickster-agent/agent/core.py
+scp .\trickster-agent\agent\memory.py root@65.21.243.4:/opt/trickster-agent/repo/trickster-agent/agent/memory.py
+```
+
+Правило для ассистента: `.cursor/rules/scp-upload.mdc`.
+
+## 7. Health checks
 
 ```bash
 systemctl status trickster-agent --no-pager -l
 journalctl -u trickster-agent -f
 systemctl status trickster-admin --no-pager -l
+systemctl status trickster-thinker --no-pager -l
 ```

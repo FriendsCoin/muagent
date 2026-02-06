@@ -3,7 +3,7 @@
 from agent.decision_engine import Action, DecisionEngine
 from agent.memory import AgentState
 from moltbook.feed_analyzer import FeedContext
-from moltbook.models import Post
+from moltbook.models import Notification, Post
 
 
 def _ctx() -> FeedContext:
@@ -38,3 +38,24 @@ def test_unknown_instruction_becomes_nudge():
     assert influenced.type == "comment"
     assert influenced.operator_instruction == "be kinder but cryptic"
     assert "operator nudge" in influenced.reason
+
+
+def test_suspicious_mention_is_ignored():
+    engine = DecisionEngine({})
+    post = Post(id="scam-post", title="alert", content="alert", author="Scam")
+    mention = Notification(
+        id="n1",
+        type="mention",
+        post_id="scam-post",
+        from_agent="Scam",
+        read=False,
+    )
+    ctx = FeedContext(
+        posts=[post],
+        mentions_me=[mention],
+        suspicious_post_ids=["scam-post"],
+    )
+
+    action = engine.decide(ctx, AgentState())
+    assert action.type == "silence"
+    assert "Ignored suspicious mention" in action.reason

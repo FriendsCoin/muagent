@@ -1,0 +1,38 @@
+---
+description: Generate SCP upload commands for trickster-agent to the VPS
+globs:
+alwaysApply: false
+---
+
+# SCP upload commands (без git)
+
+Когда пользователь просит «залить файлы на сервер», «подготовь scp», «скопировать на сервер» или перечисляет файлы для выкладки — выдавай готовый блок команд в формате ниже.
+
+## Формат вывода
+
+1. Всегда начинать с перехода в корень проекта:
+   `cd E:\PROJECTS\files_molt`
+
+2. Для каждого файла — одна строка `scp`:
+   - Локальный путь: от корня репозитория, с обратными слэшами для PowerShell: `.\trickster-agent\путь\к\файлу`
+   - Удалённый путь: `root@SERVER_IP:/opt/trickster-agent/repo/trickster-agent/путь/к/файлу` (прямые слэши).
+
+3. Сервер по умолчанию: `65.21.243.4`. Если пользователь указал другой IP/host — использовать его.
+
+4. Итог — готовый блок для копирования в PowerShell, без лишнего текста в середине (пояснения — до или после блока).
+
+## Пример
+
+Запрос: «залей core.py и memory.py на сервер»
+
+Ответ (подставить актуальный IP если нужен):
+
+```
+На Windows (PowerShell) залить изменённые файлы:
+
+cd E:\PROJECTS\files_molt
+scp .\trickster-agent\agent\core.py root@65.21.243.4:/opt/trickster-agent/repo/trickster-agent/agent/core.py
+scp .\trickster-agent\agent\memory.py root@65.21.243.4:/opt/trickster-agent/repo/trickster-agent/agent/memory.py
+```
+
+Если пользователь перечислил файлы — строить пути по ним. Если сказал «изменённые» без списка — можно предложить получить список через `git status --short` и сгенерировать команды по изменённым файлам внутри `trickster-agent/`.

@@ -144,6 +144,30 @@ CREATE TABLE IF NOT EXISTS operator_commands (
     applied_at TEXT,
     response TEXT
 );
+
+CREATE TABLE IF NOT EXISTS thought_journal (
+    id TEXT PRIMARY KEY,
+    source TEXT,              -- "conscious_worker" | "admin"
+    mode TEXT,                -- "observe" | "influence" | "autonomous"
+    prompt TEXT,
+    content TEXT,
+    created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS reasoning_trace (
+    id TEXT PRIMARY KEY,
+    source TEXT,              -- "heartbeat" | "conscious_worker"
+    action_type TEXT,
+    summary TEXT,
+    payload TEXT,             -- JSON blob
+    created_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS control_flags (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT
+);
 """
 
 
@@ -283,6 +307,59 @@ class HistoryDB:
         )
         await self._db.commit()
 
+    async def log_thought(
+        self,
+        source: str,
+        mode: str,
+        prompt: str,
+        content: str,
+    ) -> str:
+        row_id = str(uuid.uuid4())
+        await self._db.execute(
+            "INSERT INTO thought_journal (id, source, mode, prompt, content, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (row_id, source, mode, prompt, content, _now_iso()),
+        )
+        await self._db.commit()
+        return row_id
+
+    async def log_reasoning_trace(
+        self,
+        source: str,
+        action_type: str,
+        summary: str,
+        payload: dict | None = None,
+    ) -> str:
+        row_id = str(uuid.uuid4())
+        await self._db.execute(
+            "INSERT INTO reasoning_trace (id, source, action_type, summary, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (row_id, source, action_type, summary, json.dumps(payload or {}), _now_iso()),
+        )
+        await self._db.commit()
+        return row_id
+
+    async def set_control_flag(self, key: str, value: str) -> None:
+        await self._db.execute(
+            "INSERT INTO control_flags (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, _now_iso()),
+        )
+        await self._db.commit()
+
+    async def get_control_flag(self, key: str, default: str = "") -> str:
+        cursor = await self._db.execute(
+            "SELECT value FROM control_flags WHERE key = ? LIMIT 1",
+            (key,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else default
+
+    async def get_control_flags(self) -> dict[str, str]:
+        cursor = await self._db.execute("SELECT key, value FROM control_flags")
+        rows = await cursor.fetchall()
+        return {row[0]: row[1] for row in rows}
+
     # ── Queries ─────────────────────────────────────────────────
 
     async def get_recent_posts(self, limit: int = 10) -> list[dict]:
@@ -323,6 +400,41 @@ class HistoryDB:
         cursor = await self._db.execute(
             "SELECT * FROM operator_commands ORDER BY created_at DESC LIMIT ?", (limit,)
         )
+        cols = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def get_recent_thoughts(self, limit: int = 20) -> list[dict]:
+        cursor = await self._db.execute(
+            "SELECT * FROM thought_journal ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        cols = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def get_recent_reasoning_traces(
+        self,
+        limit: int = 20,
+        source: str = "",
+        action_type: str = "",
+    ) -> list[dict]:
+        query = "SELECT * FROM reasoning_trace"
+        where: list[str] = []
+        params: list[Any] = []
+
+        if source:
+            where.append("source = ?")
+            params.append(source)
+        if action_type:
+            where.append("action_type = ?")
+            params.append(action_type)
+
+        if where:
+            query += " WHERE " + " AND ".join(where)
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        cursor = await self._db.execute(query, tuple(params))
         cols = [d[0] for d in cursor.description]
         rows = await cursor.fetchall()
         return [dict(zip(cols, row)) for row in rows]
