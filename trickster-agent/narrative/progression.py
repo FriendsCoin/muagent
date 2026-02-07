@@ -74,6 +74,17 @@ def next_narrative_day(current_day: int, forbidden_days: list[int]) -> int:
     return next_day
 
 
+def post_day_label(current_day: int, posts_today: int) -> str:
+    """Human-facing day label for post titles.
+
+    First post of the day keeps classic form: "Day X".
+    Subsequent posts become: "Day X - Post N".
+    """
+    if posts_today <= 0:
+        return f"Day {current_day}"
+    return f"Day {current_day} - Post {posts_today + 1}"
+
+
 def advance_narrative_state(
     state: AgentState,
     cfg: dict[str, Any],
@@ -101,6 +112,9 @@ def advance_narrative_state(
         elapsed_days = max(0, (now_dt.date() - last_dt.date()).days)
         for _ in range(elapsed_days):
             state.current_day = next_narrative_day(state.current_day, forbidden_days)
+            # New narrative day starts with fresh daily action counters.
+            state.posts_today = 0
+            state.comments_today = 0
 
     new_phase = determine_phase(state.actual_days_active, phases_cfg)
     if new_phase != state.current_phase:

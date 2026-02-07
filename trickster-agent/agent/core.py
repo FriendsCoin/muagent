@@ -13,7 +13,7 @@ from pathlib import Path
 
 from moltbook.client import MoltbookClient, RateLimitError
 from moltbook.feed_analyzer import FeedContext, analyze_feed
-from narrative import advance_narrative_state
+from narrative import advance_narrative_state, post_day_label
 
 from .config import load_config
 from .decision_engine import Action, DecisionEngine
@@ -116,7 +116,7 @@ class MuAgent:
                     "score": action.score,
                     "operator_command_id": operator_cmd.get("id") if operator_cmd else "",
                     "result": result,
-                    "trace": action.trace,
+                    "trace": getattr(action, "trace", {}),
                 },
             )
 
@@ -182,6 +182,7 @@ class MuAgent:
         db: HistoryDB,
     ) -> str:
         """Create a new post."""
+        day_label = post_day_label(state.current_day, state.posts_today)
         content = self._personality.generate_post_text(
             theme=action.theme,
             phase=state.current_phase,
@@ -194,6 +195,9 @@ class MuAgent:
             phase=state.current_phase,
             day=state.current_day,
         )
+        # Prevent multiple same-day posts all being titled just "Day X".
+        if state.posts_today > 0 and title.strip().lower().startswith(f"day {state.current_day}".lower()):
+            title = day_label
 
         submolt = random.choice(self._cfg.get("moltbook", {}).get("preferred_submolts", ["general"]))
 

@@ -5,6 +5,7 @@ from .progression import (
     compute_actual_days_active,
     determine_phase,
     next_narrative_day,
+    post_day_label,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "compute_actual_days_active",
     "determine_phase",
     "next_narrative_day",
+    "post_day_label",
 ]

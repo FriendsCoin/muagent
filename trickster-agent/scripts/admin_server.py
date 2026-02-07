@@ -15,6 +15,7 @@ import logging
 import os
 import sqlite3
 import subprocess
+import asyncio
 import sys
 import time
 import uuid
@@ -31,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.config import load_config
 from agent.personality import Personality
+from moltbook.client import MoltbookClient, MoltbookError
 
 try:
     from agent.conscious_framework import load_conscious_framework
@@ -52,6 +54,21 @@ logger = logging.getLogger(__name__)
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    raw = ts.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def _to_bool(value: Any, default: bool = False) -> bool:
@@ -283,6 +300,45 @@ class AdminContext:
             return counts
         return counts
 
+    def fetch_post_activity(self) -> dict[str, Any]:
+        activity = {
+            "posts_last_10h": 0,
+            "posts_last_24h": 0,
+            "last_post_at": "",
+            "last_post_title": "",
+            "last_post_id": "",
+            "last_post_submolt": "",
+        }
+        if not self.db_path.exists():
+            return activity
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT created_at, title, moltbook_id, submolt FROM posts ORDER BY created_at DESC LIMIT 5000"
+                ).fetchall()
+        except sqlite3.Error:
+            return activity
+
+        now = datetime.now(timezone.utc)
+        for idx, row in enumerate(rows):
+            created_at = str(row["created_at"] or "")
+            dt = _parse_iso(created_at)
+            if dt is None:
+                continue
+
+            age_hours = (now - dt).total_seconds() / 3600.0
+            if age_hours <= 10:
+                activity["posts_last_10h"] += 1
+            if age_hours <= 24:
+                activity["posts_last_24h"] += 1
+
+            if idx == 0:
+                activity["last_post_at"] = created_at
+                activity["last_post_title"] = str(row["title"] or "")
+                activity["last_post_id"] = str(row["moltbook_id"] or "")
+                activity["last_post_submolt"] = str(row["submolt"] or "")
+        return activity
+
     def enqueue_influence(self, question: str, instruction: str) -> str:
         cmd_id = str(uuid.uuid4())
         with self._connect() as conn:
@@ -464,6 +520,20 @@ class AdminContext:
         thought_id = self.log_thought("conscious_worker", "autonomous", prompt, text)
         return thought_id, text
 
+    async def _delete_post_async(self, post_id: str) -> dict[str, Any]:
+        async with MoltbookClient(self.cfg["_secrets"]["moltbook_api_key"]) as mb:
+            post = await mb.get_post(post_id)
+            me = await mb.get_me()
+            if post.author and me.name and post.author != me.name:
+                raise MoltbookError(
+                    f"Refusing to delete чужой пост: owner={post.author}, me={me.name}"
+                )
+            await mb.delete_post(post_id)
+            return {"post_id": post_id, "title": post.title, "author": post.author}
+
+    def delete_post(self, post_id: str) -> dict[str, Any]:
+        return asyncio.run(self._delete_post_async(post_id))
+
 
 class AdminHandler(BaseHTTPRequestHandler):
     ctx: AdminContext
@@ -533,6 +603,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 {
                     "state": state,
                     "counts": counts,
+                    "post_activity": self.ctx.fetch_post_activity(),
                     "control_flags": self.ctx.get_control_flags(),
                     "conscious_framework": {
                         "dir": str(self.ctx.framework_dir),
@@ -540,6 +611,10 @@ class AdminHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
+            return
+
+        if path == "/api/post_activity":
+            self._send_json(200, self.ctx.fetch_post_activity())
             return
 
         if path == "/api/activity":
@@ -709,6 +784,23 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._send_json(200, result)
             return
 
+        if path == "/api/control/delete_post":
+            post_id = str(body.get("post_id", "")).strip()
+            confirm_text = str(body.get("confirm_text", "")).strip().upper()
+            if not post_id:
+                self._send_json(400, {"error": "post_id_required"})
+                return
+            if confirm_text != "DELETE":
+                self._send_json(400, {"error": "confirm_text_must_be_DELETE"})
+                return
+            try:
+                deleted = self.ctx.delete_post(post_id)
+            except Exception as exc:
+                self._send_json(500, {"error": f"delete_post_failed: {exc}"})
+                return
+            self._send_json(200, {"ok": True, "deleted": deleted})
+            return
+
         self._send_json(404, {"error": "not_found"})
 
 
@@ -768,6 +860,11 @@ _INDEX_HTML = """<!doctype html>
       </div>
 
       <div class="card">
+        <h2>Post Activity</h2>
+        <div id="postActivity" class="mono">loading...</div>
+      </div>
+
+      <div class="card">
         <h2>Control</h2>
         <div class="row">
           <button onclick="setPause(true)">Pause Actions</button>
@@ -778,6 +875,11 @@ _INDEX_HTML = """<!doctype html>
           <button onclick="runOnce(true)">Run Once (Dry)</button>
           <button onclick="runOnce(false)">Run Once (Live)</button>
           <button onclick="reloadFramework()">Reload Framework</button>
+        </div>
+        <div class="row">
+          <input id="deletePostId" type="text" placeholder="post_id to delete" style="min-width:320px;" />
+          <input id="deleteConfirm" type="text" placeholder="type DELETE" style="max-width:140px;" />
+          <button onclick="deletePost()">Delete Post</button>
         </div>
         <div id="controlResult" class="mono muted">No control action yet.</div>
       </div>
@@ -882,9 +984,14 @@ _INDEX_HTML = """<!doctype html>
     async function refreshStatus() {
       const d = await apiGet('/api/status');
       document.getElementById('status').textContent = JSON.stringify(d, null, 2);
+      document.getElementById('postActivity').textContent = JSON.stringify(d.post_activity || {}, null, 2);
       const flags = d.control_flags || {};
       const paused = ['1', 'true', 'yes', 'on'].includes(String(flags.pause_actions || '').toLowerCase()) || !!(d.counts && d.counts.pause_actions);
       updatePauseBadge(paused);
+    }
+    async function refreshPostActivity() {
+      const d = await apiGet('/api/post_activity');
+      document.getElementById('postActivity').textContent = JSON.stringify(d, null, 2);
     }
     async function refreshActivity() {
       const d = await apiGet('/api/activity?limit=12');
@@ -944,10 +1051,27 @@ _INDEX_HTML = """<!doctype html>
       document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
       await refreshAll();
     }
+    async function deletePost() {
+      const postId = document.getElementById('deletePostId').value.trim();
+      const confirmText = document.getElementById('deleteConfirm').value.trim();
+      if (!postId) {
+        alert('post_id required');
+        return;
+      }
+      if (confirmText.toUpperCase() !== 'DELETE') {
+        alert('Type DELETE in confirmation field');
+        return;
+      }
+      const ok = confirm('Delete post ' + postId + '? This action cannot be undone.');
+      if (!ok) return;
+      const d = await apiPost('/api/control/delete_post', {post_id: postId, confirm_text: confirmText});
+      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
+      await refreshAll();
+    }
     async function refreshAll() {
       const h = document.getElementById('health');
       try {
-        await Promise.all([refreshStatus(), refreshActivity(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
+        await Promise.all([refreshStatus(), refreshPostActivity(), refreshActivity(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
         h.textContent = 'OK';
         h.className = 'pill ok';
       } catch (e) {

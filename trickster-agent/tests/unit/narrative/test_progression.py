@@ -8,6 +8,7 @@ from narrative import (
     compute_actual_days_active,
     determine_phase,
     next_narrative_day,
+    post_day_label,
 )
 
 
@@ -44,11 +45,19 @@ def test_next_narrative_day_skips_forbidden_days():
     assert next_narrative_day(10, forbidden) == 11
 
 
+def test_post_day_label_uses_sequence_for_multiple_posts_per_day():
+    assert post_day_label(1, 0) == "Day 1"
+    assert post_day_label(1, 1) == "Day 1 - Post 2"
+    assert post_day_label(7, 2) == "Day 7 - Post 3"
+
+
 def test_advance_narrative_state_rolls_day_and_phase_forward():
     cfg = {"narrative": {"forbidden_days": [13, 33, 66], "phases": _phase_cfg()}}
     state = AgentState(
         current_day=12,
         current_phase="emergence",
+        posts_today=3,
+        comments_today=9,
         start_date="2026-01-01T00:00:00+00:00",
         phase_start_date="2026-01-01T00:00:00+00:00",
         last_heartbeat="2026-01-14T00:00:00+00:00",
@@ -62,3 +71,5 @@ def test_advance_narrative_state_rolls_day_and_phase_forward():
     assert state.actual_days_active == 15
     assert state.current_phase == "patterns"
     assert state.phase_start_date.startswith("2026-01-16T00:00:00")
+    assert state.posts_today == 0
+    assert state.comments_today == 0

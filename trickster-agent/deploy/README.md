@@ -64,11 +64,13 @@ Modes:
 - `conscious framework` checkbox: includes context from `NEW/conscious-claude-master` in responses.
 - `Reasoning Trace` panel: shows safe structured decision traces (options/scores/selection), not hidden chain-of-thought.
 - `Safety Blocks` panel: shows suspicious posts/mentions that were filtered by anti-manipulation rules.
+- `Post Activity` panel: shows post counts for last 10h/24h and latest post timestamp/title.
 - `Control` panel:
   - `Pause Actions` / `Resume Actions` (writes `pause_actions` control flag).
   - `Run Once (Dry)` for safe diagnostics.
   - `Run Once (Live)` for immediate live heartbeat (can post/comment).
   - `Reload Framework` to re-read `NEW/conscious-claude-master` without restarting service.
+  - `Delete Post` by `post_id` (requires typing `DELETE`; only own post is allowed).
 - `Debug` panel:
   - runtime snapshot,
   - key file states/sizes,
@@ -106,11 +108,41 @@ scp .\trickster-agent\agent\memory.py root@65.21.243.4:/opt/trickster-agent/repo
 
 Правило для ассистента: `.cursor/rules/scp-upload.mdc`.
 
-## 7. Health checks
+## 7. Обновление репозитория на сервере (в облаке)
+
+**С Windows (PowerShell)** — скрипт один раз дергает сервер:
+
+```powershell
+cd E:\PROJECTS\files_molt
+.\trickster-agent\deploy\update_server.ps1
+# или другой IP:
+.\trickster-agent\deploy\update_server.ps1 -ServerIp 1.2.3.4
+```
+
+**На самом сервере** — под пользователем, у которого настроен доступ к репо (например `bot`):
+
+```bash
+sudo -u bot -H bash -lc '
+cd /opt/trickster-agent/repo
+git fetch --all --prune
+git checkout main
+git pull --ff-only origin main
+'
+```
+
+После обновления кода при необходимости перезапустить сервисы (см. п. 8).
+
+## 8. Health checks
 
 ```bash
 systemctl status trickster-agent --no-pager -l
 journalctl -u trickster-agent -f
 systemctl status trickster-admin --no-pager -l
 systemctl status trickster-thinker --no-pager -l
+```
+
+Quick post activity API check:
+
+```bash
+curl -s "http://127.0.0.1:8787/api/post_activity?token=YOUR_ADMIN_TOKEN"
 ```
