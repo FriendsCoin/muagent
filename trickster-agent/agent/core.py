@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 
 from moltbook.client import MoltbookClient, RateLimitError
@@ -21,6 +22,10 @@ from .memory import AgentState, HistoryDB, StateManager
 from .personality import Personality
 
 logger = logging.getLogger(__name__)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 class MuAgent:
@@ -52,6 +57,7 @@ class MuAgent:
 
         async with MoltbookClient(self._moltbook_key) as mb, HistoryDB(self._db_path) as db:
             context = await self._perceive(mb, state)
+            await self._maybe_enqueue_think_context(db, context, state)
             if context.suspicious_posts or context.blocked_mention_notifications:
                 await db.log_narrative_event(
                     "safety_filter",
@@ -131,6 +137,47 @@ class MuAgent:
             summary = f"[Day {state.current_day}] {action.type}: {action.reason}"
             logger.info("Heartbeat complete: %s", summary)
             return summary
+
+    async def _maybe_enqueue_think_context(
+        self,
+        db: HistoryDB,
+        context: FeedContext,
+        state: AgentState,
+    ) -> None:
+        enabled = (await db.get_control_flag("thinker_enabled", "0")).strip().lower()
+        auto_queue = (await db.get_control_flag("thinker_auto_queue", "1")).strip().lower()
+        mode = (await db.get_control_flag("thinker_mode", "queue")).strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return
+        if auto_queue in {"0", "false", "no", "off"}:
+            return
+        if mode != "queue":
+            return
+
+        queue_counts = await db.get_thinker_queue_counts()
+        if queue_counts.get("pending", 0) >= 5:
+            return
+
+        posts = context.reply_worthy_posts or context.upvote_worthy_posts or context.posts
+        if not posts:
+            return
+
+        lines = [
+            f"Day={state.current_day}; phase={state.current_phase}",
+            "Top feed items:",
+        ]
+        for idx, post in enumerate(posts[:50], start=1):
+            title = (post.title or "").replace("\n", " ").strip()
+            author = (post.author or "").strip()
+            lines.append(f"{idx}. [{post.id}] {title[:140]} | by {author}")
+        if context.mentions_me:
+            lines.append("Mentions:")
+            for mention in context.mentions_me[:20]:
+                msg = (mention.message or "").replace("\n", " ").strip()
+                lines.append(f"- [{mention.id}] from={mention.from_agent} post={mention.post_id}: {msg[:200]}")
+
+        queue_context = "\n".join(lines)[:12000]
+        await db.enqueue_think_item("heartbeat", queue_context)
 
     async def _perceive(self, mb: MoltbookClient, state: AgentState) -> FeedContext:
         """Gather information from Moltbook."""
@@ -214,10 +261,17 @@ class MuAgent:
             await asyncio.sleep(delay)
 
             post = await mb.create_post(title=title, submolt=submolt, content=content)
-            await db.log_post(post.id, state.current_day, title, content, submolt=submolt)
+            post_id = (post.id or "").strip()
+            if not post_id and post.url:
+                post_id = post.url.rstrip("/").rsplit("/", 1)[-1]
+            if not post_id:
+                post_id = "unknown"
+
+            await db.log_post(post_id, state.current_day, title, content, submolt=submolt)
             state.posts_today += 1
             state.total_posts += 1
-            return f"posted: {post.id}"
+            state.last_post_time = _now_iso()
+            return f"posted: {post_id}"
         except RateLimitError as exc:
             logger.warning("Rate limited on post: %s (retry in %ds)", exc, exc.retry_after)
             return f"rate_limited: {exc.retry_after}s"
@@ -254,10 +308,12 @@ class MuAgent:
         try:
             await asyncio.sleep(random.uniform(5, 20))
             comment = await mb.create_comment(post.id, comment_text)
-            await db.log_comment(comment.id, post.id, comment_text, tone=action.tone)
+            comment_id = (comment.id or "").strip() or "unknown"
+            await db.log_comment(comment_id, post.id, comment_text, tone=action.tone)
             state.comments_today += 1
             state.total_comments += 1
-            return f"commented: {comment.id}"
+            state.last_comment_time = _now_iso()
+            return f"commented: {comment_id}"
         except RateLimitError as exc:
             logger.warning("Rate limited on comment: %s", exc)
             return f"rate_limited: {exc.retry_after}s"

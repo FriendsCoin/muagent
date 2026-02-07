@@ -169,6 +169,16 @@ CREATE TABLE IF NOT EXISTS control_flags (
     value TEXT,
     updated_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS thinker_queue (
+    id TEXT PRIMARY KEY,
+    source TEXT,
+    context TEXT,
+    status TEXT,              -- "pending" | "done" | "failed"
+    created_at TEXT,
+    processed_at TEXT,
+    error TEXT
+);
 """
 
 
@@ -360,6 +370,51 @@ class HistoryDB:
         cursor = await self._db.execute("SELECT key, value FROM control_flags")
         rows = await cursor.fetchall()
         return {row[0]: row[1] for row in rows}
+
+    async def enqueue_think_item(self, source: str, context: str) -> str:
+        row_id = str(uuid.uuid4())
+        await self._db.execute(
+            "INSERT INTO thinker_queue (id, source, context, status, created_at, processed_at, error) "
+            "VALUES (?, ?, ?, 'pending', ?, '', '')",
+            (row_id, source, context, _now_iso()),
+        )
+        await self._db.commit()
+        return row_id
+
+    async def pop_pending_think_item(self) -> dict[str, Any] | None:
+        cursor = await self._db.execute(
+            "SELECT id, source, context, status, created_at, processed_at, error "
+            "FROM thinker_queue WHERE status = 'pending' ORDER BY created_at ASC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        payload = dict(zip(cols, row))
+        await self._db.execute(
+            "UPDATE thinker_queue SET status = 'done', processed_at = ?, error = '' WHERE id = ?",
+            (_now_iso(), payload["id"]),
+        )
+        await self._db.commit()
+        return payload
+
+    async def fail_think_item(self, item_id: str, error: str) -> None:
+        await self._db.execute(
+            "UPDATE thinker_queue SET status = 'failed', processed_at = ?, error = ? WHERE id = ?",
+            (_now_iso(), error[:1000], item_id),
+        )
+        await self._db.commit()
+
+    async def get_thinker_queue_counts(self) -> dict[str, int]:
+        result = {"pending": 0, "done": 0, "failed": 0}
+        for status in result:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM thinker_queue WHERE status = ?",
+                (status,),
+            )
+            row = await cursor.fetchone()
+            result[status] = int(row[0]) if row else 0
+        return result
 
     # ── Queries ─────────────────────────────────────────────────
 

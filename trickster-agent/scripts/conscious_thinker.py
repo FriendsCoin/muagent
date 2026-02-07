@@ -21,6 +21,15 @@ from agent.personality import Personality
 logger = logging.getLogger(__name__)
 
 
+def _flag_enabled(value: str, default: bool = False) -> bool:
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 def _setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
@@ -45,21 +54,51 @@ async def _run_loop(
     logger.info("Conscious thinker started. framework_available=%s", framework.available)
     while True:
         state = state_mgr.load()
+        async with HistoryDB(db_path) as db:
+            enabled = _flag_enabled(await db.get_control_flag("thinker_enabled", "0"), default=False)
+            mode = (await db.get_control_flag("thinker_mode", "queue")).strip().lower() or "queue"
+            queue_item = None
+            if mode == "queue":
+                queue_item = await db.pop_pending_think_item()
+
+        if not enabled:
+            await asyncio.sleep(60)
+            continue
+
+        if mode not in {"queue", "interval"}:
+            mode = "queue"
+
+        if mode == "queue" and queue_item is None:
+            await asyncio.sleep(60)
+            continue
+
         prompt = (
             "Generate one private thought-journal entry as Mu. "
             "This is not a public post and should not issue instructions. "
             "2-6 concise sentences with self-reflection."
         )
+        if queue_item:
+            queue_ctx = str(queue_item.get("context") or "").strip()
+            if queue_ctx:
+                prompt += "\n\nQueue context from agent feed:\n" + queue_ctx[:6000]
         if framework.available:
             prompt += "\n\nUse this optional context:\n" + framework.context_block(max_chars=4500)
 
-        thought = personality.generate_post_text(
-            theme=f"autonomous reflection day {state.current_day}",
-            phase=state.current_phase,
-            day=state.current_day,
-            context=prompt,
-            total_posts=state.total_posts,
-        )
+        try:
+            thought = personality.generate_post_text(
+                theme=f"autonomous reflection day {state.current_day}",
+                phase=state.current_phase,
+                day=state.current_day,
+                context=prompt,
+                total_posts=state.total_posts,
+            )
+        except Exception as exc:
+            if queue_item:
+                async with HistoryDB(db_path) as db:
+                    await db.fail_think_item(queue_item["id"], str(exc))
+            logger.warning("Thought generation failed: %s", exc)
+            await asyncio.sleep(60)
+            continue
 
         async with HistoryDB(db_path) as db:
             await db.log_thought(
@@ -75,13 +114,19 @@ async def _run_loop(
                 payload={
                     "day": state.current_day,
                     "phase": state.current_phase,
+                    "mode": mode,
                     "framework_available": framework.available,
+                    "queue_item_id": (queue_item or {}).get("id", ""),
                     "prompt_preview": prompt[:280],
                     "thought_preview": thought[:280],
                 },
             )
-        logger.info("Thought journal entry created (%d chars)", len(thought))
-        await asyncio.sleep(max(60, interval_minutes * 60))
+        logger.info("Thought journal entry created (%d chars), mode=%s", len(thought), mode)
+
+        if mode == "interval":
+            await asyncio.sleep(max(60, interval_minutes * 60))
+        else:
+            await asyncio.sleep(10)
 
 
 @click.command()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import re
 from typing import Any
 
 
@@ -23,6 +24,20 @@ def _as_agent_name(value: Any) -> str:
                 return _as_text(value[key])
         return ""
     return _as_text(value)
+
+
+def _extract_entity_id(data: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = _as_text(data.get(key, ""))
+        if value:
+            return value
+
+    url = _as_text(data.get("url", ""))
+    if url:
+        match = re.search(r"/posts/([^/?#]+)", url)
+        if match:
+            return match.group(1)
+    return ""
 
 
 @dataclass
@@ -65,7 +80,7 @@ class Post:
         author = data.get("author", data.get("author_name", ""))
         submolt = data.get("submolt", data.get("submolt_name", ""))
         return cls(
-            id=_as_text(data.get("id", "")),
+            id=_extract_entity_id(data, "id", "post_id", "uuid"),
             title=_as_text(data.get("title", "")),
             content=_as_text(data.get("content", "")),
             url=_as_text(data.get("url", "")),
@@ -93,8 +108,8 @@ class Comment:
     def from_api(cls, data: dict) -> Comment:
         author = data.get("author", data.get("author_name", ""))
         return cls(
-            id=_as_text(data.get("id", "")),
-            post_id=_as_text(data.get("post_id", "")),
+            id=_extract_entity_id(data, "id", "comment_id", "uuid"),
+            post_id=_extract_entity_id(data, "post_id", "postId"),
             content=_as_text(data.get("content", "")),
             author=_as_agent_name(author),
             parent_id=_as_text(data.get("parent_id")) or None,

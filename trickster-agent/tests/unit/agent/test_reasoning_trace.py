@@ -93,3 +93,24 @@ def test_control_flags_roundtrip(tmp_path: Path):
             assert flags["pause_actions"] == "1"
 
     asyncio.run(_run())
+
+
+def test_thinker_queue_roundtrip(tmp_path: Path):
+    db_path = tmp_path / "history.db"
+
+    async def _run() -> None:
+        async with HistoryDB(db_path) as db:
+            item_id = await db.enqueue_think_item("heartbeat", "ctx")
+            counts = await db.get_thinker_queue_counts()
+            assert counts["pending"] == 1
+
+            item = await db.pop_pending_think_item()
+            assert item is not None
+            assert item["id"] == item_id
+            assert item["source"] == "heartbeat"
+
+            counts = await db.get_thinker_queue_counts()
+            assert counts["pending"] == 0
+            assert counts["done"] == 1
+
+    asyncio.run(_run())

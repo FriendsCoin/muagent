@@ -156,6 +156,19 @@ def _ensure_admin_tables(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thinker_queue (
+                id TEXT PRIMARY KEY,
+                source TEXT,
+                context TEXT,
+                status TEXT,
+                created_at TEXT,
+                processed_at TEXT,
+                error TEXT
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -278,6 +291,7 @@ class AdminContext:
             "thoughts": 0,
             "reasoning_traces": 0,
             "pause_actions": False,
+            "thinker_queue_pending": 0,
         }
         if not self.db_path.exists():
             return counts
@@ -291,6 +305,9 @@ class AdminContext:
                 counts["thoughts"] = conn.execute("SELECT COUNT(*) FROM thought_journal").fetchone()[0]
                 counts["reasoning_traces"] = conn.execute(
                     "SELECT COUNT(*) FROM reasoning_trace"
+                ).fetchone()[0]
+                counts["thinker_queue_pending"] = conn.execute(
+                    "SELECT COUNT(*) FROM thinker_queue WHERE status = 'pending'"
                 ).fetchone()[0]
                 row = conn.execute(
                     "SELECT value FROM control_flags WHERE key = 'pause_actions' LIMIT 1"
@@ -314,7 +331,10 @@ class AdminContext:
         try:
             with self._connect() as conn:
                 rows = conn.execute(
-                    "SELECT created_at, title, moltbook_id, submolt FROM posts ORDER BY created_at DESC LIMIT 5000"
+                    "SELECT id, created_at, title, moltbook_id, submolt "
+                    "FROM posts "
+                    "WHERE COALESCE(moltbook_id, '') != 'dry_run' "
+                    "ORDER BY created_at DESC LIMIT 5000"
                 ).fetchall()
         except sqlite3.Error:
             return activity
@@ -335,9 +355,80 @@ class AdminContext:
             if idx == 0:
                 activity["last_post_at"] = created_at
                 activity["last_post_title"] = str(row["title"] or "")
-                activity["last_post_id"] = str(row["moltbook_id"] or "")
+                activity["last_post_id"] = str(row["moltbook_id"] or row["id"] or "")
                 activity["last_post_submolt"] = str(row["submolt"] or "")
         return activity
+
+    def fetch_timeline(self, limit: int = 20) -> list[dict[str, Any]]:
+        if not self.db_path.exists():
+            return []
+        items: list[dict[str, Any]] = []
+        try:
+            with self._connect() as conn:
+                posts = conn.execute(
+                    "SELECT id, created_at, title, submolt FROM posts ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                comments = conn.execute(
+                    "SELECT id, created_at, post_id, content FROM comments ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                thoughts = conn.execute(
+                    "SELECT id, created_at, mode, content FROM thought_journal ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+                safety = conn.execute(
+                    "SELECT id, created_at, description FROM narrative_events WHERE event_type = 'safety_filter' "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        except sqlite3.Error:
+            return []
+
+        for row in posts:
+            items.append(
+                {
+                    "kind": "post",
+                    "created_at": str(row["created_at"] or ""),
+                    "summary": f"{row['title']} (s/{row['submolt']})",
+                    "id": str(row["id"] or ""),
+                }
+            )
+        for row in comments:
+            preview = str(row["content"] or "").replace("\n", " ").strip()
+            items.append(
+                {
+                    "kind": "comment",
+                    "created_at": str(row["created_at"] or ""),
+                    "summary": f"on {row['post_id']}: {preview[:90]}",
+                    "id": str(row["id"] or ""),
+                }
+            )
+        for row in thoughts:
+            preview = str(row["content"] or "").replace("\n", " ").strip()
+            items.append(
+                {
+                    "kind": "thought",
+                    "created_at": str(row["created_at"] or ""),
+                    "summary": f"{row['mode']}: {preview[:90]}",
+                    "id": str(row["id"] or ""),
+                }
+            )
+        for row in safety:
+            items.append(
+                {
+                    "kind": "safety",
+                    "created_at": str(row["created_at"] or ""),
+                    "summary": str(row["description"] or ""),
+                    "id": str(row["id"] or ""),
+                }
+            )
+
+        def _sort_key(item: dict[str, Any]) -> str:
+            return str(item.get("created_at") or "")
+
+        items.sort(key=_sort_key, reverse=True)
+        return items[:limit]
 
     def enqueue_influence(self, question: str, instruction: str) -> str:
         cmd_id = str(uuid.uuid4())
@@ -636,6 +727,16 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path == "/api/timeline":
+            params = parse_qs(parsed.query)
+            try:
+                limit = int(params.get("limit", ["20"])[0])
+            except ValueError:
+                limit = 20
+            limit = max(1, min(200, limit))
+            self._send_json(200, {"items": self.ctx.fetch_timeline(limit=limit), "limit": limit})
+            return
+
         if path == "/api/safety":
             params = parse_qs(parsed.query)
             try:
@@ -770,6 +871,25 @@ class AdminHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/control/thinker":
+            enabled = _to_bool(body.get("enabled", False), default=False)
+            mode = str(body.get("mode", "queue")).strip().lower()
+            auto_queue = _to_bool(body.get("auto_queue", True), default=True)
+            if mode not in {"queue", "interval"}:
+                self._send_json(400, {"error": "invalid_mode"})
+                return
+            self.ctx.set_control_flag("thinker_enabled", "1" if enabled else "0")
+            self.ctx.set_control_flag("thinker_mode", mode)
+            self.ctx.set_control_flag("thinker_auto_queue", "1" if auto_queue else "0")
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "control_flags": self.ctx.get_control_flags(),
+                },
+            )
+            return
+
         if path == "/api/control/run_once":
             dry_run = _to_bool(body.get("dry_run", True), default=True)
             timeout_seconds = int(body.get("timeout_seconds", 240))
@@ -828,7 +948,7 @@ _INDEX_HTML = """<!doctype html>
     .card { border: 1px solid var(--border); background: var(--card); border-radius: 12px; padding: 12px; }
     h1 { margin: 0 0 12px 0; font-size: 24px; }
     h2 { margin: 0 0 10px 0; font-size: 16px; color: var(--accent); }
-    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; }
+    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; max-height: 340px; overflow: auto; word-break: break-word; }
     input, textarea, select, button {
       background: #0f131b; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 8px;
     }
@@ -877,6 +997,16 @@ _INDEX_HTML = """<!doctype html>
           <button onclick="reloadFramework()">Reload Framework</button>
         </div>
         <div class="row">
+          <label class="muted">Thinker</label>
+          <select id="thinkerMode">
+            <option value="queue" selected>queue</option>
+            <option value="interval">interval</option>
+          </select>
+          <label class="muted"><input id="thinkerEnabled" type="checkbox" /> enabled</label>
+          <label class="muted"><input id="thinkerAutoQueue" type="checkbox" checked /> auto queue</label>
+          <button onclick="saveThinkerConfig()">Apply Thinker</button>
+        </div>
+        <div class="row">
           <input id="deletePostId" type="text" placeholder="post_id to delete" style="min-width:320px;" />
           <input id="deleteConfirm" type="text" placeholder="type DELETE" style="max-width:140px;" />
           <button onclick="deletePost()">Delete Post</button>
@@ -902,12 +1032,47 @@ _INDEX_HTML = """<!doctype html>
       </div>
       <div class="card">
         <h2>Recent Activity</h2>
+        <div class="row">
+          <label class="muted">limit</label>
+          <select id="activityLimit">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="20">20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          <button onclick="refreshActivity()">Apply</button>
+        </div>
         <div id="activity" class="mono">loading...</div>
+      </div>
+
+      <div class="card">
+        <h2>Live Timeline</h2>
+        <div class="row">
+          <label class="muted">limit</label>
+          <select id="timelineLimit">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="20">20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          <button onclick="refreshTimeline()">Apply</button>
+        </div>
+        <div id="timeline" class="mono">loading...</div>
       </div>
 
       <div class="card">
         <h2>Reasoning Trace</h2>
         <div class="row">
+          <label class="muted">limit</label>
+          <select id="reasoningLimit">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="20">20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
           <select id="reasoningSource">
             <option value="">all sources</option>
             <option value="heartbeat">heartbeat</option>
@@ -922,6 +1087,14 @@ _INDEX_HTML = """<!doctype html>
       <div class="card">
         <h2>Safety Blocks</h2>
         <div class="row">
+          <label class="muted">limit</label>
+          <select id="safetyLimit">
+            <option value="5">5</option>
+            <option value="10" selected>10</option>
+            <option value="20">20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
           <button onclick="refreshSafety()">Refresh Safety</button>
         </div>
         <div id="safety" class="mono">loading...</div>
@@ -929,6 +1102,17 @@ _INDEX_HTML = """<!doctype html>
 
       <div class="card">
         <h2>Logs</h2>
+        <div class="row">
+          <label class="muted">lines</label>
+          <select id="logsLimit">
+            <option value="50">50</option>
+            <option value="100" selected>100</option>
+            <option value="200">200</option>
+            <option value="500">500</option>
+            <option value="1000">1000</option>
+          </select>
+          <button onclick="refreshLogs()">Refresh Logs</button>
+        </div>
         <div id="logs" class="mono">loading...</div>
       </div>
 
@@ -988,31 +1172,41 @@ _INDEX_HTML = """<!doctype html>
       const flags = d.control_flags || {};
       const paused = ['1', 'true', 'yes', 'on'].includes(String(flags.pause_actions || '').toLowerCase()) || !!(d.counts && d.counts.pause_actions);
       updatePauseBadge(paused);
-    }
-    async function refreshPostActivity() {
-      const d = await apiGet('/api/post_activity');
-      document.getElementById('postActivity').textContent = JSON.stringify(d, null, 2);
+      const thinkerEnabled = ['1', 'true', 'yes', 'on'].includes(String(flags.thinker_enabled || '').toLowerCase());
+      const thinkerAutoQueue = !['0', 'false', 'no', 'off'].includes(String(flags.thinker_auto_queue || '1').toLowerCase());
+      document.getElementById('thinkerEnabled').checked = thinkerEnabled;
+      document.getElementById('thinkerAutoQueue').checked = thinkerAutoQueue;
+      document.getElementById('thinkerMode').value = String(flags.thinker_mode || 'queue');
     }
     async function refreshActivity() {
-      const d = await apiGet('/api/activity?limit=12');
+      const limit = Number(document.getElementById('activityLimit').value || 10);
+      const d = await apiGet('/api/activity?limit=' + encodeURIComponent(String(limit)));
       document.getElementById('activity').textContent = JSON.stringify(d, null, 2);
     }
     async function refreshLogs() {
-      const d = await apiGet('/api/logs?lines=120');
+      const lines = Number(document.getElementById('logsLimit').value || 100);
+      const d = await apiGet('/api/logs?lines=' + encodeURIComponent(String(lines)));
       document.getElementById('logs').textContent = (d.lines || []).join('\\n');
     }
     async function refreshReasoning() {
+      const limit = Number(document.getElementById('reasoningLimit').value || 10);
       const source = document.getElementById('reasoningSource').value;
       const actionType = document.getElementById('reasoningAction').value.trim();
-      let path = '/api/reasoning?limit=20';
+      let path = '/api/reasoning?limit=' + encodeURIComponent(String(limit));
       if (source) path += '&source=' + encodeURIComponent(source);
       if (actionType) path += '&action_type=' + encodeURIComponent(actionType);
       const d = await apiGet(path);
       document.getElementById('reasoning').textContent = JSON.stringify(d, null, 2);
     }
     async function refreshSafety() {
-      const d = await apiGet('/api/safety?limit=20');
+      const limit = Number(document.getElementById('safetyLimit').value || 10);
+      const d = await apiGet('/api/safety?limit=' + encodeURIComponent(String(limit)));
       document.getElementById('safety').textContent = JSON.stringify(d, null, 2);
+    }
+    async function refreshTimeline() {
+      const limit = Number(document.getElementById('timelineLimit').value || 10);
+      const d = await apiGet('/api/timeline?limit=' + encodeURIComponent(String(limit)));
+      document.getElementById('timeline').textContent = JSON.stringify(d, null, 2);
     }
     async function refreshDebug() {
       const d = await apiGet('/api/debug/runtime');
@@ -1039,6 +1233,14 @@ _INDEX_HTML = """<!doctype html>
     }
     async function reloadFramework() {
       const d = await apiPost('/api/control/reload_framework', {});
+      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
+      await refreshAll();
+    }
+    async function saveThinkerConfig() {
+      const enabled = document.getElementById('thinkerEnabled').checked;
+      const autoQueue = document.getElementById('thinkerAutoQueue').checked;
+      const mode = document.getElementById('thinkerMode').value;
+      const d = await apiPost('/api/control/thinker', {enabled, auto_queue: autoQueue, mode});
       document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
       await refreshAll();
     }
@@ -1071,7 +1273,7 @@ _INDEX_HTML = """<!doctype html>
     async function refreshAll() {
       const h = document.getElementById('health');
       try {
-        await Promise.all([refreshStatus(), refreshPostActivity(), refreshActivity(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
+        await Promise.all([refreshStatus(), refreshActivity(), refreshTimeline(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
         h.textContent = 'OK';
         h.className = 'pill ok';
       } catch (e) {

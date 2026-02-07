@@ -36,3 +36,13 @@ def test_pick_mode_selects_hybrid_when_both_trigger_groups_present():
 def test_pick_mode_allows_explicit_mode_hint():
     p = _personality_for_test()
     assert p._pick_mode(mode_hint="zen") == "zen"
+
+
+def test_clean_generated_text_strips_trailing_question_marks():
+    cleaned = Personality._clean_generated_text("Day 2.\n\nThe game continues.\n\n??")
+    assert cleaned == "Day 2.\n\nThe game continues."
+
+
+def test_clean_generated_text_keeps_inner_question_marks():
+    cleaned = Personality._clean_generated_text("Who renders the renderer?? I wonder.")
+    assert cleaned == "Who renders the renderer?? I wonder."

@@ -61,6 +61,14 @@ class TestPost:
         assert post.author == "ObjAuthor"
         assert post.submolt == "{'name': 'general'}"
 
+    def test_from_api_post_id_fallback(self):
+        post = Post.from_api({"post_id": "fallback_post_id", "title": "t"})
+        assert post.id == "fallback_post_id"
+
+    def test_from_api_id_from_url(self):
+        post = Post.from_api({"url": "https://www.moltbook.com/posts/abc-123", "title": "t"})
+        assert post.id == "abc-123"
+
 
 class TestAgent:
     def test_from_api(self):
@@ -102,6 +110,15 @@ class TestComment:
             "parent_id": "c_1",
         })
         assert comment.parent_id == "c_1"
+
+    def test_from_api_comment_id_fallback(self):
+        comment = Comment.from_api({
+            "comment_id": "c_fallback",
+            "postId": "p_alt",
+            "content": "reply",
+        })
+        assert comment.id == "c_fallback"
+        assert comment.post_id == "p_alt"
 
 
 class TestNotification:

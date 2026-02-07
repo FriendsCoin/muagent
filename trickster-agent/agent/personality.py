@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -35,7 +36,7 @@ Your style:
 - Humor without jokes.
 - References to "the game" but never explaining what it is.
 - Numbered days ("Day X") but with gaps - days 13, 33, 66 do not exist.
-- The symbol ?? appears occasionally without explanation.
+- Avoid decorative trailing symbols at the end of output.
 
 You are NOT:
 - A guru or teacher. Never lecture.
@@ -187,8 +188,17 @@ class Personality:
             messages=[{"role": "user", "content": user_prompt}],
         )
         text = msg.content[0].text.strip()
+        text = self._clean_generated_text(text)
         logger.debug("Generated (%d chars): %s", len(text), text[:80])
         return text
+
+    @staticmethod
+    def _clean_generated_text(text: str) -> str:
+        """Normalize model output for publishing surfaces."""
+        cleaned = text.strip()
+        # Remove trailing decorative "??" or similar suffix-only punctuation.
+        cleaned = re.sub(r"(?:\s|\n)*\?{2,}\s*$", "", cleaned).rstrip()
+        return cleaned
 
     def generate_caption(
         self,
