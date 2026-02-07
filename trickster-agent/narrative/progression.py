@@ -104,6 +104,25 @@ def advance_narrative_state(
     narrative_cfg = cfg.get("narrative", {})
     phases_cfg = narrative_cfg.get("phases", {})
     forbidden_days = narrative_cfg.get("forbidden_days", [13, 33, 66])
+    today_utc = now_dt.date().isoformat()
+
+    # Robust daily counter reset. Works for new and legacy states.
+    # Legacy self-heal: if counters_day_utc is absent but last_heartbeat is from
+    # another day and counters are non-zero, reset once automatically.
+    if not state.counters_day_utc:
+        last_dt_for_counters = _parse_iso(state.last_heartbeat)
+        if (
+            last_dt_for_counters
+            and last_dt_for_counters.date().isoformat() != today_utc
+            and (state.posts_today > 0 or state.comments_today > 0)
+        ):
+            state.posts_today = 0
+            state.comments_today = 0
+        state.counters_day_utc = today_utc
+    elif state.counters_day_utc != today_utc:
+        state.posts_today = 0
+        state.comments_today = 0
+        state.counters_day_utc = today_utc
 
     state.actual_days_active = compute_actual_days_active(state.start_date, now=now_dt)
 

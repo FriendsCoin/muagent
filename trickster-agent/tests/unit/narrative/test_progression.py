@@ -73,3 +73,26 @@ def test_advance_narrative_state_rolls_day_and_phase_forward():
     assert state.phase_start_date.startswith("2026-01-16T00:00:00")
     assert state.posts_today == 0
     assert state.comments_today == 0
+    assert state.counters_day_utc == "2026-01-16"
+
+
+def test_advance_narrative_state_self_heals_legacy_daily_counters():
+    cfg = {"narrative": {"forbidden_days": [13, 33, 66], "phases": _phase_cfg()}}
+    state = AgentState(
+        current_day=2,
+        current_phase="emergence",
+        posts_today=3,
+        comments_today=11,
+        # Legacy state: counters_day_utc missing
+        counters_day_utc="",
+        start_date="2026-02-06T17:31:03+00:00",
+        last_heartbeat="2026-02-06T22:42:47+00:00",
+    )
+    now = datetime(2026, 2, 7, 11, 46, 0, tzinfo=timezone.utc)
+
+    advance_narrative_state(state, cfg, now=now)
+
+    assert state.current_day == 3
+    assert state.posts_today == 0
+    assert state.comments_today == 0
+    assert state.counters_day_utc == "2026-02-07"

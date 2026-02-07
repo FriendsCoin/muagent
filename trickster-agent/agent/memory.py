@@ -39,6 +39,7 @@ class AgentState:
     last_comment_time: str = ""
     posts_today: int = 0
     comments_today: int = 0
+    counters_day_utc: str = ""  # YYYY-MM-DD for daily counters reset
 
     # Social graph
     followed_agents: list[str] = field(default_factory=list)
