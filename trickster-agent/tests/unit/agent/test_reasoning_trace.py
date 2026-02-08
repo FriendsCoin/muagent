@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from agent.decision_engine import DecisionEngine, _PHASE_MAX_POSTS, _PHASE_SILENCE_BOOST
 from agent.memory import AgentState, HistoryDB
 from moltbook.feed_analyzer import FeedContext
@@ -155,3 +157,57 @@ def test_phase_silence_boost_increases_with_phase():
     assert _PHASE_SILENCE_BOOST["emergence"] < _PHASE_SILENCE_BOOST["patterns"]
     assert _PHASE_SILENCE_BOOST["patterns"] < _PHASE_SILENCE_BOOST["tension"]
     assert _PHASE_SILENCE_BOOST["tension"] < _PHASE_SILENCE_BOOST["mirror"]
+
+
+# ── Visual context blending (feed distillation) ─────────────
+
+
+def _blend_visual_context(operator_instruction: str, feed_visual_keywords: str) -> str:
+    """Replicate the blending logic from _do_post for testing."""
+    visual_context = feed_visual_keywords
+    if operator_instruction:
+        if feed_visual_keywords:
+            visual_context = f"{operator_instruction[:70]}; {feed_visual_keywords[:70]}"
+        else:
+            visual_context = operator_instruction
+    return visual_context
+
+
+def test_visual_context_feed_keywords_only():
+    result = _blend_visual_context("", "void, recursion, digital garden")
+    assert result == "void, recursion, digital garden"
+
+
+def test_visual_context_operator_instruction_only():
+    result = _blend_visual_context("draw something cosmic", "")
+    assert result == "draw something cosmic"
+
+
+def test_visual_context_both_blended():
+    result = _blend_visual_context("draw something cosmic", "void, recursion, garden")
+    assert result == "draw something cosmic; void, recursion, garden"
+    assert result.index("draw something cosmic") < result.index("void, recursion")
+
+
+def test_visual_context_both_truncated():
+    long_instruction = "x" * 100
+    long_keywords = "k" * 100
+    result = _blend_visual_context(long_instruction, long_keywords)
+    # Each half is truncated to 70 chars
+    assert len(result) <= 70 + 2 + 70  # "; " separator
+
+
+def test_visual_context_nothing_interesting_skips():
+    """When feed is nothing_interesting, feed_visual_keywords stays empty."""
+    ctx = FeedContext(nothing_interesting=True)
+    # Simulate the guard in _do_post: skip distillation when nothing_interesting
+    feed_visual_keywords = ""
+    if not ctx.nothing_interesting:
+        feed_visual_keywords = "should not reach here"
+    result = _blend_visual_context("", feed_visual_keywords)
+    assert result == ""
+
+
+def test_visual_context_empty_when_no_sources():
+    result = _blend_visual_context("", "")
+    assert result == ""

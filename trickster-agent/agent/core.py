@@ -12,6 +12,7 @@ import random
 from datetime import datetime, timezone
 from pathlib import Path
 
+from imagegen import VisualGenerator
 from moltbook.client import MoltbookClient, RateLimitError
 from moltbook.feed_analyzer import FeedContext, analyze_feed
 from narrative import (
@@ -53,6 +54,7 @@ class MuAgent:
         )
         self._decision = DecisionEngine(self._cfg)
         self._moltbook_key = self._cfg["_secrets"]["moltbook_api_key"]
+        self._visual = VisualGenerator(self._cfg)
 
     async def heartbeat(self) -> str:
         """One complete cycle: perceive -> decide -> act."""
@@ -115,7 +117,7 @@ class MuAgent:
                 }
                 logger.info("Pause flag is active: action overridden to silence")
 
-            result = await self._act(action, state, mb, db)
+            result = await self._act(action, state, mb, db, context)
 
             await db.log_reasoning_trace(
                 source="heartbeat",
@@ -206,6 +208,7 @@ class MuAgent:
         state: AgentState,
         mb: MoltbookClient,
         db: HistoryDB,
+        feed_context: FeedContext | None = None,
     ) -> str:
         """Execute the decided action."""
 
@@ -215,7 +218,7 @@ class MuAgent:
             return "silence"
 
         if action.type == "post":
-            return await self._do_post(action, state, mb, db)
+            return await self._do_post(action, state, mb, db, feed_context)
 
         if action.type == "comment":
             return await self._do_comment(action, state, mb, db)
@@ -232,6 +235,7 @@ class MuAgent:
         state: AgentState,
         mb: MoltbookClient,
         db: HistoryDB,
+        feed_context: FeedContext | None = None,
     ) -> str:
         """Create a new post."""
         # Check if this post should include the narrative sigil.
@@ -248,8 +252,50 @@ class MuAgent:
             total_posts=state.total_posts,
             sigil=sigil,
         )
+        instruction_low = (action.operator_instruction or "").lower()
+        force_visual_mode = ""
+        if any(token in instruction_low for token in ("ascii", "asci", "аски", "текст-арт")):
+            force_visual_mode = "ascii"
+        elif any(token in instruction_low for token in ("image", "img", "картин", "illustration", "render")):
+            force_visual_mode = "url"
+
+        # Distill feed context into visual keywords.
+        feed_visual_keywords = ""
+        if feed_context and not feed_context.nothing_interesting:
+            feed_visual_keywords = self._personality.distill_feed_for_visual(
+                post_titles=[p.title for p in feed_context.interesting_posts[:20]],
+                trending_topics=feed_context.trending_topics,
+                phase=state.current_phase,
+            )
+
+        # Blend: operator instruction takes priority, feed keywords augment.
+        visual_context = feed_visual_keywords
+        if action.operator_instruction:
+            if feed_visual_keywords:
+                visual_context = f"{action.operator_instruction[:70]}; {feed_visual_keywords[:70]}"
+            else:
+                visual_context = action.operator_instruction
+
+        visual = self._visual.generate(
+            theme=action.theme,
+            mood=action.visual_mood,
+            phase=state.current_phase,
+            day=state.current_day,
+            context=visual_context,
+            force_mode=force_visual_mode,
+        )
+        post_content = content
+        post_url: str | None = None
+        image_path = ""
+        if visual.kind == "ascii" and visual.ascii_art:
+            post_content = f"{content}\n\n{visual.ascii_art}".strip()
+            image_path = f"ascii:{visual.provider}"
+        elif visual.kind == "url" and visual.url:
+            post_url = visual.url
+            image_path = visual.url
+
         title = self._personality.generate_post_title(
-            content=content,
+            content=post_content,
             phase=state.current_phase,
             day=state.current_day,
         )
@@ -257,9 +303,25 @@ class MuAgent:
         submolt = random.choice(self._cfg.get("moltbook", {}).get("preferred_submolts", ["general"]))
 
         if self._dry_run:
-            logger.info("[DRY RUN] Would post to s/%s: %s - %s", submolt, title, content)
-            await db.log_post("dry_run", state.current_day, title, content, submolt=submolt)
-            return f"dry_run_post: {title}"
+            if post_url:
+                logger.info(
+                    "[DRY RUN] Would post link to s/%s: %s - %s | url=%s",
+                    submolt,
+                    title,
+                    post_content,
+                    post_url,
+                )
+            else:
+                logger.info("[DRY RUN] Would post to s/%s: %s - %s", submolt, title, post_content)
+            await db.log_post(
+                "dry_run",
+                state.current_day,
+                title,
+                post_content,
+                image_path=image_path,
+                submolt=submolt,
+            )
+            return f"dry_run_post: {title} | visual={visual.kind}"
 
         try:
             delay = random.uniform(
@@ -268,27 +330,34 @@ class MuAgent:
             )
             await asyncio.sleep(delay)
 
-            post = await mb.create_post(title=title, submolt=submolt, content=content)
+            post = await mb.create_post(title=title, submolt=submolt, content=post_content, url=post_url)
             post_id = (post.id or "").strip()
             if not post_id and post.url:
                 post_id = post.url.rstrip("/").rsplit("/", 1)[-1]
             if not post_id:
                 post_id = "unknown"
 
-            await db.log_post(post_id, state.current_day, title, content, submolt=submolt)
+            await db.log_post(
+                post_id,
+                state.current_day,
+                title,
+                post_content,
+                image_path=image_path,
+                submolt=submolt,
+            )
             state.posts_today += 1
             state.total_posts += 1
             state.last_post_time = _now_iso()
 
             # Track breadcrumbs placed in the post.
             if sigil:
-                crumbs = detect_breadcrumbs(content, sigil)
+                crumbs = detect_breadcrumbs(post_content, sigil)
                 if crumbs:
                     state.breadcrumbs_placed += len(crumbs)
                     for symbol in crumbs:
                         state.symbols_used[symbol] = state.symbols_used.get(symbol, 0) + 1
 
-            return f"posted: {post_id}"
+            return f"posted: {post_id} | visual={visual.kind}"
         except RateLimitError as exc:
             logger.warning("Rate limited on post: %s (retry in %ds)", exc, exc.retry_after)
             return f"rate_limited: {exc.retry_after}s"

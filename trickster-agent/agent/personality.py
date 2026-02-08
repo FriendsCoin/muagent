@@ -310,6 +310,50 @@ class Personality:
         )
         return self._generate(prompt, phase=phase, day=day, mode="zen", max_tokens=50)
 
+    def distill_feed_for_visual(
+        self,
+        post_titles: list[str],
+        trending_topics: list[str],
+        phase: str = "emergence",
+    ) -> str:
+        """Distill feed context into compact visual keywords for image generation.
+
+        Makes a small, cheap LLM call (bypassing VOICE_SYSTEM) to extract
+        5-8 visual/aesthetic keywords from recent feed activity.  Returns an
+        empty string when there is nothing to distill.
+        """
+        titles = [t.strip() for t in post_titles if t and t.strip()]
+        topics = [t.strip() for t in trending_topics if t and t.strip()]
+        if not titles and not topics:
+            return ""
+
+        parts: list[str] = []
+        if titles:
+            parts.append("Recent post titles:\n" + "\n".join(f"- {t[:120]}" for t in titles[:20]))
+        if topics:
+            parts.append("Trending topics: " + ", ".join(topics[:10]))
+        parts.append(f"Current narrative phase: {phase}")
+        user_block = "\n\n".join(parts)
+
+        try:
+            msg = self._client.messages.create(
+                model=self._model,
+                max_tokens=60,
+                temperature=0.7,
+                system=(
+                    "You extract visual keywords from social-media feed data. "
+                    "Output ONLY 5-8 comma-separated aesthetic/visual keywords "
+                    "that capture the feed's mood and themes. No explanation."
+                ),
+                messages=[{"role": "user", "content": user_block}],
+            )
+            keywords = msg.content[0].text.strip()
+            logger.debug("Feed visual keywords: %s", keywords)
+            return keywords
+        except Exception:
+            logger.warning("Feed distillation failed, skipping", exc_info=True)
+            return ""
+
     def generate_dm_reply(
         self,
         from_agent: str,

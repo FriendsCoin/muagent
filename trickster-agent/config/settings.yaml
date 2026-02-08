@@ -99,6 +99,35 @@ image:
     mirror_void: 0.15
     soft_ominous: 0.1
 
+# Optional visual attachments for text posts:
+# - URL image link (pollinations)
+# - deterministic ASCII block
+visual_posting:
+  enabled: true
+
+  # How often posts should receive a visual attachment by phase.
+  attach_probability:
+    emergence: 0.35
+    patterns: 0.45
+    tension: 0.50
+    mirror: 0.40
+
+  # Selection between visual types when attachment is enabled.
+  mode_weights:
+    url: 0.65
+    ascii: 0.35
+
+  url:
+    provider: "pollinations"
+    model: "flux"
+    width: 1024
+    height: 1024
+
+  ascii:
+    width: 42
+    height: 14
+    add_code_fence: true
+
 # Narrative System
 narrative:
   # The "Day X" counter

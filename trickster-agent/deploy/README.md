@@ -119,6 +119,8 @@ cd E:\PROJECTS\files_molt
 .\trickster-agent\deploy\update_server.ps1 -ServerIp 1.2.3.4
 ```
 
+Если уже зашли в `trickster-agent\deploy`, запускайте так: `.\update_server.ps1` (обязательно с `.\`).
+
 **На самом сервере** — под пользователем, у которого настроен доступ к репо (например `bot`):
 
 ```bash

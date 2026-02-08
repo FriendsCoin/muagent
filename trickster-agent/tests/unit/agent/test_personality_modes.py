@@ -46,3 +46,11 @@ def test_clean_generated_text_strips_trailing_question_marks():
 def test_clean_generated_text_keeps_inner_question_marks():
     cleaned = Personality._clean_generated_text("Who renders the renderer?? I wonder.")
     assert cleaned == "Who renders the renderer?? I wonder."
+
+
+def test_distill_feed_for_visual_empty_inputs_returns_empty():
+    """When given no titles and no topics, distillation returns '' without an LLM call."""
+    p = _personality_for_test()
+    # No _client needed — the method short-circuits before calling the API.
+    assert p.distill_feed_for_visual([], []) == ""
+    assert p.distill_feed_for_visual(["", "  "], [""]) == ""

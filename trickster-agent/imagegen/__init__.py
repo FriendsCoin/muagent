@@ -1,1 +1,5 @@
-"""Image generation — Runware (cloud) and ComfyUI (local) providers."""
+"""Image generation helpers."""
+
+from .generator import VisualAttachment, VisualGenerator
+
+__all__ = ["VisualAttachment", "VisualGenerator"]
