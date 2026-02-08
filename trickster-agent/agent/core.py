@@ -34,6 +34,22 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _flag_to_bool(value: str) -> bool | None:
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    return None
+
+
+def _truncate_text(value: str, limit: int) -> str:
+    text = str(value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
 class MuAgent:
     """The autonomous trickster agent."""
 
@@ -252,11 +268,31 @@ class MuAgent:
             total_posts=state.total_posts,
             sigil=sigil,
         )
+        visual_enabled_override = _flag_to_bool(await db.get_control_flag("visual_enabled", ""))
+        visual_mode_flag = (await db.get_control_flag("visual_mode", "auto")).strip().lower()
+        visual_provider_flag = (await db.get_control_flag("visual_url_provider", "")).strip().lower()
+        visual_attach_prob_raw = (await db.get_control_flag("visual_attach_probability", "")).strip()
+        visual_attach_prob_override: float | None = None
+        if visual_attach_prob_raw:
+            try:
+                parsed = float(visual_attach_prob_raw)
+                visual_attach_prob_override = max(0.0, min(1.0, parsed))
+            except ValueError:
+                visual_attach_prob_override = None
+
         instruction_low = (action.operator_instruction or "").lower()
         force_visual_mode = ""
-        if any(token in instruction_low for token in ("ascii", "asci", "аски", "текст-арт")):
+        if visual_mode_flag in {"off", "none", "disable", "disabled"}:
+            force_visual_mode = ""
+            visual_enabled_override = False
+        elif visual_mode_flag in {"url", "ascii"}:
+            force_visual_mode = visual_mode_flag
+        elif any(token in instruction_low for token in ("ascii", "asci", "text-art", "text art")):
             force_visual_mode = "ascii"
-        elif any(token in instruction_low for token in ("image", "img", "картин", "illustration", "render")):
+        elif any(
+            token in instruction_low
+            for token in ("image", "img", "illustration", "render", "artwork")
+        ):
             force_visual_mode = "url"
 
         # Distill feed context into visual keywords.
@@ -283,7 +319,69 @@ class MuAgent:
             day=state.current_day,
             context=visual_context,
             force_mode=force_visual_mode,
+            enabled_override=visual_enabled_override,
+            attach_probability_override=visual_attach_prob_override,
+            url_provider_override=visual_provider_flag,
         )
+        if visual.kind != "none":
+            requested_url_provider = (
+                visual_provider_flag
+                or str(self._cfg.get("visual_posting", {}).get("url", {}).get("provider", "pollinations"))
+            ).strip().lower()
+            runware_fallback_used = (
+                requested_url_provider == "runware"
+                and visual.kind == "url"
+                and visual.provider != "runware"
+            )
+            feed_titles: list[str] = []
+            feed_topics: list[str] = []
+            if feed_context:
+                feed_titles = [
+                    _truncate_text(post.title, 120)
+                    for post in (feed_context.interesting_posts or feed_context.posts)[:8]
+                    if post.title
+                ]
+                feed_topics = [
+                    _truncate_text(topic, 40)
+                    for topic in (feed_context.trending_topics or [])[:8]
+                    if topic
+                ]
+
+            context_sources: list[str] = []
+            if action.operator_instruction:
+                context_sources.append("operator_instruction")
+            if feed_visual_keywords:
+                context_sources.append("feed_keywords")
+            if feed_topics:
+                context_sources.append("trending_topics")
+            if not context_sources:
+                context_sources.append("theme_only")
+
+            await db.log_narrative_event(
+                "visual_generated",
+                f"visual={visual.kind} provider={visual.provider}",
+                metadata={
+                    "kind": visual.kind,
+                    "provider": visual.provider,
+                    "prompt": _truncate_text(visual.prompt, 500),
+                    "mode_flag": visual_mode_flag,
+                    "operator_forced": force_visual_mode,
+                    "theme": action.theme,
+                    "phase": state.current_phase,
+                    "day": state.current_day,
+                    "operator_instruction": _truncate_text(action.operator_instruction, 220),
+                    "feed_visual_keywords": _truncate_text(feed_visual_keywords, 220),
+                    "visual_context": _truncate_text(visual_context, 220),
+                    "feed_trending_topics": feed_topics,
+                    "feed_top_titles": feed_titles,
+                    "context_source": "+".join(context_sources),
+                    "enabled_override": visual_enabled_override,
+                    "attach_probability_override": visual_attach_prob_override,
+                    "provider_override": visual_provider_flag,
+                    "requested_url_provider": requested_url_provider,
+                    "runware_fallback_used": runware_fallback_used,
+                },
+            )
         post_content = content
         post_url: str | None = None
         image_path = ""

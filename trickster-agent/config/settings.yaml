@@ -118,8 +118,14 @@ visual_posting:
     ascii: 0.35
 
   url:
+    # provider: "pollinations" | "runware"
     provider: "pollinations"
     model: "flux"
+    # Used when provider=runware (falls back to image.runware.default_model if empty)
+    runware_model: "runware:100@1"
+    endpoint: "https://api.runware.ai/v1"
+    timeout_seconds: 25
+    number_results: 1
     width: 1024
     height: 1024
 

@@ -32,6 +32,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from agent.config import load_config
 from agent.personality import Personality
+from imagegen import VisualGenerator
 from moltbook.client import MoltbookClient, MoltbookError
 
 try:
@@ -430,6 +431,258 @@ class AdminContext:
         items.sort(key=_sort_key, reverse=True)
         return items[:limit]
 
+    def _visual_effective_flags(self) -> dict[str, Any]:
+        flags = self.get_control_flags()
+        enabled_raw = str(flags.get("visual_enabled", "")).strip().lower()
+        if enabled_raw in {"1", "true", "yes", "on"}:
+            enabled = True
+        elif enabled_raw in {"0", "false", "no", "off"}:
+            enabled = False
+        else:
+            enabled = bool(self.cfg.get("visual_posting", {}).get("enabled", False))
+
+        mode = str(flags.get("visual_mode", "auto")).strip().lower() or "auto"
+        if mode not in {"auto", "url", "ascii", "off"}:
+            mode = "auto"
+
+        provider = str(flags.get("visual_url_provider", "")).strip().lower()
+        if not provider:
+            provider = str(self.cfg.get("visual_posting", {}).get("url", {}).get("provider", "pollinations"))
+
+        prob_raw = str(flags.get("visual_attach_probability", "")).strip()
+        prob = None
+        if prob_raw:
+            try:
+                prob = max(0.0, min(1.0, float(prob_raw)))
+            except ValueError:
+                prob = None
+
+        return {
+            "enabled": enabled,
+            "mode": mode,
+            "url_provider": provider,
+            "attach_probability_override": prob,
+        }
+
+    def fetch_visual_status(self, limit: int = 20) -> dict[str, Any]:
+        visual_cfg = self.cfg.get("visual_posting", {}) if isinstance(self.cfg, dict) else {}
+        secrets = self.cfg.get("_secrets", {}) if isinstance(self.cfg, dict) else {}
+        effective = self._visual_effective_flags()
+
+        recent_visual_posts: list[dict[str, Any]] = []
+        recent_visual_events: list[dict[str, Any]] = []
+        if self.db_path.exists():
+            try:
+                with self._connect() as conn:
+                    rows = conn.execute(
+                        "SELECT id, created_at, title, submolt, image_path, moltbook_id "
+                        "FROM posts WHERE COALESCE(image_path, '') != '' "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                    recent_visual_posts = [dict(r) for r in rows]
+
+                    event_rows = conn.execute(
+                        "SELECT id, event_type, description, metadata, created_at "
+                        "FROM narrative_events "
+                        "WHERE event_type IN ('visual_generated', 'visual_error') "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+            except sqlite3.Error:
+                event_rows = []
+            else:
+                for row in event_rows:
+                    item = dict(row)
+                    raw = item.get("metadata", "")
+                    if isinstance(raw, str) and raw:
+                        try:
+                            item["metadata"] = json.loads(raw)
+                        except json.JSONDecodeError:
+                            pass
+                    recent_visual_events.append(item)
+
+        runware_key_present = bool(str(secrets.get("runware_api_key", "")).strip())
+        runware_requested_recent = 0
+        runware_success_recent = 0
+        runware_fallback_recent = 0
+        runware_last_event_at = ""
+        runware_last_provider = ""
+        for item in recent_visual_events:
+            if str(item.get("event_type", "")) != "visual_generated":
+                continue
+            metadata = item.get("metadata", {})
+            if not isinstance(metadata, dict):
+                continue
+            requested = str(
+                metadata.get("requested_url_provider")
+                or metadata.get("provider_override")
+                or ""
+            ).strip().lower()
+            if requested != "runware":
+                continue
+            runware_requested_recent += 1
+            provider = str(metadata.get("provider", "")).strip().lower()
+            fallback = _to_bool(metadata.get("runware_fallback_used", False), default=False)
+            if provider == "runware":
+                runware_success_recent += 1
+            if fallback or (provider and provider != "runware"):
+                runware_fallback_recent += 1
+            if not runware_last_event_at:
+                runware_last_event_at = str(item.get("created_at") or "")
+                runware_last_provider = provider
+
+        if not runware_key_present:
+            runware_state = "no_key"
+            runware_message = "RUNWARE_API_KEY missing"
+        elif runware_requested_recent == 0:
+            runware_state = "unknown"
+            runware_message = "No recent runware-targeted visual events"
+        elif runware_success_recent > 0 and runware_fallback_recent == 0:
+            runware_state = "ok"
+            runware_message = "Runware used successfully"
+        elif runware_success_recent == 0 and runware_fallback_recent > 0:
+            runware_state = "fallback"
+            runware_message = "Runware requests fell back to pollinations"
+        else:
+            runware_state = "mixed"
+            runware_message = "Mixed runware success and fallback"
+
+        return {
+            "enabled_in_config": bool(visual_cfg.get("enabled", False)),
+            "effective": effective,
+            "providers": {
+                "url_configured_provider": str(visual_cfg.get("url", {}).get("provider", "pollinations")),
+                "runware_key_present": runware_key_present,
+                "runware_endpoint": str(visual_cfg.get("url", {}).get("endpoint", "https://api.runware.ai/v1")),
+            },
+            "runware_runtime": {
+                "state": runware_state,
+                "message": runware_message,
+                "requested_recent": runware_requested_recent,
+                "success_recent": runware_success_recent,
+                "fallback_recent": runware_fallback_recent,
+                "last_event_at": runware_last_event_at,
+                "last_provider": runware_last_provider,
+            },
+            "mode_weights": visual_cfg.get("mode_weights", {"url": 0.65, "ascii": 0.35}),
+            "attach_probability": visual_cfg.get(
+                "attach_probability",
+                {"emergence": 0.35, "patterns": 0.45, "tension": 0.5, "mirror": 0.4},
+            ),
+            "control_flags": {k: v for k, v in self.get_control_flags().items() if k.startswith("visual_")},
+            "recent_visual_posts": recent_visual_posts,
+            "recent_visual_events": recent_visual_events,
+            "limit": limit,
+        }
+
+    def fetch_visual_why(self, limit: int = 20) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        if not self.db_path.exists():
+            return {"items": items, "limit": limit}
+
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT id, created_at, description, metadata "
+                    "FROM narrative_events "
+                    "WHERE event_type = 'visual_generated' "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        except sqlite3.Error:
+            rows = []
+
+        for row in rows:
+            raw = dict(row)
+            metadata: dict[str, Any] = {}
+            raw_meta = raw.get("metadata", "")
+            if isinstance(raw_meta, str) and raw_meta:
+                try:
+                    loaded = json.loads(raw_meta)
+                    if isinstance(loaded, dict):
+                        metadata = loaded
+                except json.JSONDecodeError:
+                    metadata = {}
+
+            feed_topics = metadata.get("feed_trending_topics", [])
+            if not isinstance(feed_topics, list):
+                feed_topics = []
+            feed_titles = metadata.get("feed_top_titles", [])
+            if not isinstance(feed_titles, list):
+                feed_titles = []
+
+            context_source = str(metadata.get("context_source", "")).strip()
+            if not context_source:
+                derived: list[str] = []
+                if str(metadata.get("operator_instruction", "")).strip():
+                    derived.append("operator_instruction")
+                if str(metadata.get("feed_visual_keywords", "")).strip():
+                    derived.append("feed_keywords")
+                if feed_topics:
+                    derived.append("trending_topics")
+                if not derived:
+                    derived.append("theme_only")
+                context_source = "+".join(derived)
+
+            items.append(
+                {
+                    "id": str(raw.get("id") or ""),
+                    "created_at": str(raw.get("created_at") or ""),
+                    "description": str(raw.get("description") or ""),
+                    "kind": str(metadata.get("kind", "")),
+                    "provider": str(metadata.get("provider", "")),
+                    "theme": str(metadata.get("theme", "")),
+                    "phase": str(metadata.get("phase", "")),
+                    "day": metadata.get("day"),
+                    "context_source": context_source,
+                    "why": {
+                        "mode_flag": str(metadata.get("mode_flag", "")),
+                        "operator_forced": str(metadata.get("operator_forced", "")),
+                        "feed_visual_keywords": str(metadata.get("feed_visual_keywords", "")),
+                        "visual_context": str(metadata.get("visual_context", "")),
+                        "operator_instruction": str(metadata.get("operator_instruction", "")),
+                        "feed_trending_topics": feed_topics,
+                        "feed_top_titles": feed_titles,
+                    },
+                }
+            )
+        return {"items": items, "limit": limit}
+
+    def test_visual_generation(
+        self,
+        *,
+        prompt: str,
+        mode: str = "auto",
+        phase: str = "emergence",
+        day: int = 1,
+    ) -> dict[str, Any]:
+        generator = VisualGenerator(self.cfg)
+        force_mode = mode if mode in {"url", "ascii"} else ""
+        effective = self._visual_effective_flags()
+        visual = generator.generate(
+            theme=prompt[:80] or "mystery",
+            mood="soft_ominous",
+            phase=phase or "emergence",
+            day=max(1, int(day)),
+            context=prompt,
+            force_mode=force_mode,
+            enabled_override=effective["enabled"],
+            attach_probability_override=1.0 if mode != "auto" else effective["attach_probability_override"],
+            url_provider_override=str(effective["url_provider"] or ""),
+        )
+        payload = {
+            "kind": visual.kind,
+            "provider": visual.provider,
+            "prompt": visual.prompt,
+            "url": visual.url,
+            "ascii_art": visual.ascii_art,
+            "phase": phase,
+            "day": day,
+            "mode": mode,
+        }
+        return payload
+
     def enqueue_influence(self, question: str, instruction: str) -> str:
         cmd_id = str(uuid.uuid4())
         with self._connect() as conn:
@@ -708,6 +961,26 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._send_json(200, self.ctx.fetch_post_activity())
             return
 
+        if path == "/api/visual/status":
+            params = parse_qs(parsed.query)
+            try:
+                limit = int(params.get("limit", ["20"])[0])
+            except ValueError:
+                limit = 20
+            limit = max(1, min(200, limit))
+            self._send_json(200, self.ctx.fetch_visual_status(limit=limit))
+            return
+
+        if path == "/api/visual/why":
+            params = parse_qs(parsed.query)
+            try:
+                limit = int(params.get("limit", ["20"])[0])
+            except ValueError:
+                limit = 20
+            limit = max(1, min(200, limit))
+            self._send_json(200, self.ctx.fetch_visual_why(limit=limit))
+            return
+
         if path == "/api/activity":
             params = parse_qs(parsed.query)
             try:
@@ -890,6 +1163,63 @@ class AdminHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/control/visual":
+            enabled = _to_bool(body.get("enabled", True), default=True)
+            mode = str(body.get("mode", "auto")).strip().lower()
+            provider = str(body.get("url_provider", "")).strip().lower()
+            attach_probability_raw = str(body.get("attach_probability", "")).strip()
+            if mode not in {"auto", "url", "ascii", "off"}:
+                self._send_json(400, {"error": "invalid_mode"})
+                return
+            if provider and provider not in {"pollinations", "runware"}:
+                self._send_json(400, {"error": "invalid_provider"})
+                return
+
+            self.ctx.set_control_flag("visual_enabled", "1" if enabled else "0")
+            self.ctx.set_control_flag("visual_mode", mode)
+            if provider:
+                self.ctx.set_control_flag("visual_url_provider", provider)
+
+            if attach_probability_raw:
+                try:
+                    prob = max(0.0, min(1.0, float(attach_probability_raw)))
+                except ValueError:
+                    self._send_json(400, {"error": "invalid_attach_probability"})
+                    return
+                self.ctx.set_control_flag("visual_attach_probability", f"{prob:.3f}")
+            else:
+                self.ctx.set_control_flag("visual_attach_probability", "")
+
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "control_flags": self.ctx.get_control_flags(),
+                    "visual_status": self.ctx.fetch_visual_status(limit=10),
+                },
+            )
+            return
+
+        if path == "/api/visual/test":
+            prompt = str(body.get("prompt", "")).strip()
+            mode = str(body.get("mode", "auto")).strip().lower()
+            phase = str(body.get("phase", "emergence")).strip().lower() or "emergence"
+            try:
+                day = int(body.get("day", 1))
+            except (TypeError, ValueError):
+                day = 1
+            if mode not in {"auto", "url", "ascii"}:
+                self._send_json(400, {"error": "invalid_mode"})
+                return
+            payload = self.ctx.test_visual_generation(
+                prompt=prompt or "mu glitch consciousness",
+                mode=mode,
+                phase=phase,
+                day=max(1, day),
+            )
+            self._send_json(200, payload)
+            return
+
         if path == "/api/control/run_once":
             dry_run = _to_bool(body.get("dry_run", True), default=True)
             timeout_seconds = int(body.get("timeout_seconds", 240))
@@ -972,6 +1302,7 @@ _INDEX_HTML = """<!doctype html>
       <label class="muted"><input id="conscious" type="checkbox" checked /> conscious framework</label>
       <span id="health" class="pill muted">loading</span>
       <span id="pauseState" class="pill muted">pause: unknown</span>
+      <span id="runwareState" class="pill muted">runware: unknown</span>
     </div>
     <div class="grid">
       <div class="card">
@@ -982,6 +1313,64 @@ _INDEX_HTML = """<!doctype html>
       <div class="card">
         <h2>Post Activity</h2>
         <div id="postActivity" class="mono">loading...</div>
+      </div>
+
+      <div class="card">
+        <h2>Visual Generation</h2>
+        <div class="row">
+          <label class="muted"><input id="visualEnabled" type="checkbox" checked /> enabled</label>
+          <label class="muted">mode</label>
+          <select id="visualMode">
+            <option value="auto" selected>auto</option>
+            <option value="url">url</option>
+            <option value="ascii">ascii</option>
+            <option value="off">off</option>
+          </select>
+          <label class="muted">provider</label>
+          <select id="visualProvider">
+            <option value="pollinations" selected>pollinations</option>
+            <option value="runware">runware</option>
+          </select>
+          <label class="muted">attach p</label>
+          <input id="visualAttachProbability" type="number" min="0" max="1" step="0.05" placeholder="auto" style="width:90px;" />
+          <button onclick="saveVisualConfig()">Apply Visual</button>
+          <label class="muted">history</label>
+          <select id="visualLimit">
+            <option value="5">5</option>
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          <button onclick="refreshVisualStatus(); refreshVisualWhy();">Refresh Visual</button>
+        </div>
+        <div class="row">
+          <input id="visualTestPrompt" type="text" placeholder="test prompt (optional)" style="min-width:280px;" />
+          <select id="visualTestMode">
+            <option value="auto" selected>auto test</option>
+            <option value="url">force url</option>
+            <option value="ascii">force ascii</option>
+          </select>
+          <button onclick="testVisual()">Test Visual</button>
+        </div>
+        <div id="visualStatus" class="mono">loading...</div>
+        <div id="visualResult" class="mono muted">No visual test yet.</div>
+      </div>
+
+      <div class="card">
+        <h2>Why This Visual</h2>
+        <div class="row">
+          <label class="muted">limit</label>
+          <select id="visualWhyLimit">
+            <option value="5">5</option>
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          <button onclick="refreshVisualWhy()">Refresh Why</button>
+        </div>
+        <div id="visualWhy" class="mono">loading...</div>
       </div>
 
       <div class="card">
@@ -1165,6 +1554,27 @@ _INDEX_HTML = """<!doctype html>
         el.className = 'pill ok';
       }
     }
+    function updateRunwareBadge(runtime) {
+      const el = document.getElementById('runwareState');
+      const state = String((runtime || {}).state || 'unknown');
+      const message = String((runtime || {}).message || '');
+      if (state === 'ok') {
+        el.textContent = 'runware: OK';
+        el.className = 'pill ok';
+      } else if (state === 'fallback' || state === 'mixed') {
+        el.textContent = 'runware: fallback';
+        el.className = 'pill warn';
+      } else if (state === 'no_key') {
+        el.textContent = 'runware: no key';
+        el.className = 'pill err';
+      } else {
+        el.textContent = 'runware: unknown';
+        el.className = 'pill muted';
+      }
+      if (message) {
+        el.title = message;
+      }
+    }
     async function refreshStatus() {
       const d = await apiGet('/api/status');
       document.getElementById('status').textContent = JSON.stringify(d, null, 2);
@@ -1182,6 +1592,23 @@ _INDEX_HTML = """<!doctype html>
       const limit = Number(document.getElementById('activityLimit').value || 10);
       const d = await apiGet('/api/activity?limit=' + encodeURIComponent(String(limit)));
       document.getElementById('activity').textContent = JSON.stringify(d, null, 2);
+    }
+    async function refreshVisualStatus() {
+      const limit = Number(document.getElementById('visualLimit').value || 20);
+      const d = await apiGet('/api/visual/status?limit=' + encodeURIComponent(String(limit)));
+      document.getElementById('visualStatus').textContent = JSON.stringify(d, null, 2);
+      const effective = d.effective || {};
+      document.getElementById('visualEnabled').checked = !!effective.enabled;
+      document.getElementById('visualMode').value = String(effective.mode || 'auto');
+      document.getElementById('visualProvider').value = String(effective.url_provider || 'pollinations');
+      const p = effective.attach_probability_override;
+      document.getElementById('visualAttachProbability').value = (p === null || p === undefined) ? '' : String(p);
+      updateRunwareBadge(d.runware_runtime || {});
+    }
+    async function refreshVisualWhy() {
+      const limit = Number(document.getElementById('visualWhyLimit').value || 20);
+      const d = await apiGet('/api/visual/why?limit=' + encodeURIComponent(String(limit)));
+      document.getElementById('visualWhy').textContent = JSON.stringify(d, null, 2);
     }
     async function refreshLogs() {
       const lines = Number(document.getElementById('logsLimit').value || 100);
@@ -1244,6 +1671,37 @@ _INDEX_HTML = """<!doctype html>
       document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
       await refreshAll();
     }
+    async function saveVisualConfig() {
+      const enabled = document.getElementById('visualEnabled').checked;
+      const mode = document.getElementById('visualMode').value;
+      const urlProvider = document.getElementById('visualProvider').value;
+      const attachProbability = document.getElementById('visualAttachProbability').value.trim();
+      const payload = {
+        enabled,
+        mode,
+        url_provider: urlProvider,
+        attach_probability: attachProbability,
+      };
+      const d = await apiPost('/api/control/visual', payload);
+      document.getElementById('visualResult').textContent = JSON.stringify(d, null, 2);
+      await refreshAll();
+    }
+    async function testVisual() {
+      const prompt = document.getElementById('visualTestPrompt').value.trim();
+      const mode = document.getElementById('visualTestMode').value;
+      const status = await apiGet('/api/status');
+      const state = status.state || {};
+      const payload = {
+        prompt: prompt || 'mu glitch void mirror',
+        mode,
+        phase: String(state.current_phase || 'emergence'),
+        day: Number(state.current_day || 1),
+      };
+      const d = await apiPost('/api/visual/test', payload);
+      document.getElementById('visualResult').textContent = JSON.stringify(d, null, 2);
+      await refreshVisualStatus();
+      await refreshVisualWhy();
+    }
     async function runOnce(dryRun) {
       if (!dryRun) {
         const ok = confirm('Run live heartbeat now? It may publish/comment immediately.');
@@ -1273,7 +1731,7 @@ _INDEX_HTML = """<!doctype html>
     async function refreshAll() {
       const h = document.getElementById('health');
       try {
-        await Promise.all([refreshStatus(), refreshActivity(), refreshTimeline(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
+        await Promise.all([refreshStatus(), refreshVisualStatus(), refreshVisualWhy(), refreshActivity(), refreshTimeline(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
         h.textContent = 'OK';
         h.className = 'pill ok';
       } catch (e) {

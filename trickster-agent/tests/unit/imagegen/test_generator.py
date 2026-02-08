@@ -54,3 +54,38 @@ def test_visual_generator_force_mode_works_even_when_disabled():
         force_mode="ascii",
     )
     assert visual.kind == "ascii"
+
+
+def test_visual_generator_enabled_override_disables_output():
+    cfg = {
+        "visual_posting": {
+            "enabled": True,
+            "attach_probability": {"emergence": 1.0},
+            "mode_weights": {"url": 1.0, "ascii": 0.0},
+        }
+    }
+    gen = VisualGenerator(cfg)
+    visual = gen.generate(
+        theme="void",
+        mood="soft_ominous",
+        phase="emergence",
+        day=2,
+        enabled_override=False,
+    )
+    assert visual.kind == "none"
+
+
+def test_visual_generator_runware_without_key_falls_back():
+    cfg = {
+        "_secrets": {"runware_api_key": ""},
+        "visual_posting": {
+            "enabled": True,
+            "attach_probability": {"emergence": 1.0},
+            "mode_weights": {"url": 1.0, "ascii": 0.0},
+            "url": {"provider": "runware", "width": 512, "height": 512},
+        },
+    }
+    gen = VisualGenerator(cfg)
+    visual = gen.generate(theme="render", mood="soft_ominous", phase="emergence", day=2)
+    assert visual.kind == "url"
+    assert visual.provider in {"pollinations", "pollinations_fallback"}
