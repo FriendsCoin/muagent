@@ -42,6 +42,20 @@ DEFAULT_WEIGHTS = {
     "chaos_factor": 0.15,
 }
 
+_PHASE_MAX_POSTS = {
+    "emergence": 3,
+    "patterns": 2,
+    "tension": 2,
+    "mirror": 1,
+}
+
+_PHASE_SILENCE_BOOST = {
+    "emergence": 0.0,
+    "patterns": 0.05,
+    "tension": 0.15,
+    "mirror": 0.25,
+}
+
 
 class DecisionEngine:
     """Decide what Mu should do."""
@@ -125,7 +139,8 @@ class DecisionEngine:
 
         options: list[Action] = []
 
-        if state.posts_today < 3:
+        max_posts = _PHASE_MAX_POSTS.get(state.current_phase, 3)
+        if state.posts_today < max_posts:
             theme = self._pick_theme(context, state)
             options.append(
                 Action(
@@ -160,10 +175,11 @@ class DecisionEngine:
                 )
             )
 
+        silence_boost = _PHASE_SILENCE_BOOST.get(state.current_phase, 0.0)
         options.append(
             Action(
                 type="silence",
-                score=self._silence_prob + random.uniform(0, 0.1),
+                score=self._silence_prob + silence_boost + random.uniform(0, 0.1),
                 reason="Intentional silence - sometimes the best move is no move",
             )
         )

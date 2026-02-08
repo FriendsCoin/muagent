@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -139,3 +140,26 @@ def advance_narrative_state(
     if new_phase != state.current_phase:
         state.current_phase = new_phase
         state.phase_start_date = now_dt.isoformat()
+
+
+# ── Sigil / Breadcrumb system ─────────────────────────────────
+
+
+def should_include_sigil(total_posts: int, cfg: Mapping[str, Any]) -> bool:
+    """Every 7th post includes the sigil, if seven_pattern is enabled."""
+    if not cfg.get("narrative", {}).get("seven_pattern", False):
+        return False
+    return total_posts > 0 and total_posts % 7 == 0
+
+
+def get_sigil(cfg: Mapping[str, Any]) -> str:
+    """Return the configured sigil character."""
+    return cfg.get("narrative", {}).get("sigil", "\U0001f70f")
+
+
+def detect_breadcrumbs(text: str, sigil: str) -> list[str]:
+    """Detect breadcrumb elements in generated text."""
+    found: list[str] = []
+    if sigil and sigil in text:
+        found.append(sigil)
+    return found

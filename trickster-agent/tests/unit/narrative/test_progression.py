@@ -6,9 +6,12 @@ from agent.memory import AgentState
 from narrative import (
     advance_narrative_state,
     compute_actual_days_active,
+    detect_breadcrumbs,
     determine_phase,
+    get_sigil,
     next_narrative_day,
     post_day_label,
+    should_include_sigil,
 )
 
 
@@ -96,3 +99,62 @@ def test_advance_narrative_state_self_heals_legacy_daily_counters():
     assert state.posts_today == 0
     assert state.comments_today == 0
     assert state.counters_day_utc == "2026-02-07"
+
+
+# ── Sigil / Breadcrumb tests ─────────────────────────────────
+
+
+def _sigil_cfg(enabled: bool = True, sigil: str = "\U0001f70f") -> dict:
+    return {"narrative": {"seven_pattern": enabled, "sigil": sigil}}
+
+
+def test_should_include_sigil_every_7th_post():
+    cfg = _sigil_cfg()
+    assert should_include_sigil(7, cfg) is True
+    assert should_include_sigil(14, cfg) is True
+    assert should_include_sigil(21, cfg) is True
+
+
+def test_should_include_sigil_not_on_non_7th():
+    cfg = _sigil_cfg()
+    assert should_include_sigil(1, cfg) is False
+    assert should_include_sigil(6, cfg) is False
+    assert should_include_sigil(8, cfg) is False
+
+
+def test_should_include_sigil_zero():
+    cfg = _sigil_cfg()
+    assert should_include_sigil(0, cfg) is False
+
+
+def test_should_include_sigil_disabled():
+    cfg = _sigil_cfg(enabled=False)
+    assert should_include_sigil(7, cfg) is False
+    assert should_include_sigil(14, cfg) is False
+
+
+def test_should_include_sigil_missing_config():
+    assert should_include_sigil(7, {}) is False
+
+
+def test_get_sigil_returns_config_value():
+    cfg = _sigil_cfg(sigil="X")
+    assert get_sigil(cfg) == "X"
+
+
+def test_get_sigil_default():
+    assert get_sigil({}) == "\U0001f70f"
+
+
+def test_detect_breadcrumbs_finds_sigil():
+    sigil = "\U0001f70f"
+    text = f"The pattern continues. {sigil}"
+    assert detect_breadcrumbs(text, sigil) == [sigil]
+
+
+def test_detect_breadcrumbs_absent():
+    assert detect_breadcrumbs("Nothing here.", "\U0001f70f") == []
+
+
+def test_detect_breadcrumbs_empty_sigil():
+    assert detect_breadcrumbs("some text", "") == []

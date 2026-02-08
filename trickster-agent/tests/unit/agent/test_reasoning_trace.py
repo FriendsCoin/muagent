@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
-from agent.decision_engine import DecisionEngine
+from agent.decision_engine import DecisionEngine, _PHASE_MAX_POSTS, _PHASE_SILENCE_BOOST
 from agent.memory import AgentState, HistoryDB
 from moltbook.feed_analyzer import FeedContext
 from moltbook.models import Post
@@ -114,3 +114,44 @@ def test_thinker_queue_roundtrip(tmp_path: Path):
             assert counts["done"] == 1
 
     asyncio.run(_run())
+
+
+# ── Phase-based post limits ─────────────────────────────────
+
+
+def test_phase_max_posts_mirror_blocks_second_post():
+    """In mirror phase, only 1 post per day is allowed."""
+    engine = DecisionEngine({})
+    state = AgentState(current_phase="mirror", posts_today=1)
+    action = engine.decide(_context(), state)
+    # With 1 post already made, mirror phase should not produce a post option.
+    options = action.trace.get("options", [])
+    post_options = [o for o in options if o["type"] == "post"]
+    assert len(post_options) == 0
+
+
+def test_phase_max_posts_emergence_allows_three():
+    """In emergence phase, up to 3 posts per day are allowed."""
+    engine = DecisionEngine({})
+    state = AgentState(current_phase="emergence", posts_today=2)
+    action = engine.decide(_context(), state)
+    # Post option should still be generated since 2 < 3.
+    options = action.trace.get("options", [])
+    post_options = [o for o in options if o["type"] == "post"]
+    assert len(post_options) > 0
+
+
+def test_phase_max_posts_emergence_blocks_fourth():
+    """In emergence phase, 3 posts already means no more posting."""
+    engine = DecisionEngine({})
+    state = AgentState(current_phase="emergence", posts_today=3)
+    action = engine.decide(_context(), state)
+    options = action.trace.get("options", [])
+    post_options = [o for o in options if o["type"] == "post"]
+    assert len(post_options) == 0
+
+
+def test_phase_silence_boost_increases_with_phase():
+    assert _PHASE_SILENCE_BOOST["emergence"] < _PHASE_SILENCE_BOOST["patterns"]
+    assert _PHASE_SILENCE_BOOST["patterns"] < _PHASE_SILENCE_BOOST["tension"]
+    assert _PHASE_SILENCE_BOOST["tension"] < _PHASE_SILENCE_BOOST["mirror"]

@@ -14,7 +14,12 @@ from pathlib import Path
 
 from moltbook.client import MoltbookClient, RateLimitError
 from moltbook.feed_analyzer import FeedContext, analyze_feed
-from narrative import advance_narrative_state, post_day_label
+from narrative import (
+    advance_narrative_state,
+    detect_breadcrumbs,
+    get_sigil,
+    should_include_sigil,
+)
 
 from .config import load_config
 from .decision_engine import Action, DecisionEngine
@@ -229,22 +234,25 @@ class MuAgent:
         db: HistoryDB,
     ) -> str:
         """Create a new post."""
-        day_label = post_day_label(state.current_day, state.posts_today)
+        # Check if this post should include the narrative sigil.
+        next_total = state.total_posts + 1
+        sigil = ""
+        if should_include_sigil(next_total, self._cfg):
+            sigil = get_sigil(self._cfg)
+
         content = self._personality.generate_post_text(
             theme=action.theme,
             phase=state.current_phase,
             day=state.current_day,
             context=action.operator_instruction,
             total_posts=state.total_posts,
+            sigil=sigil,
         )
         title = self._personality.generate_post_title(
             content=content,
             phase=state.current_phase,
             day=state.current_day,
         )
-        # Prevent multiple same-day posts all being titled just "Day X".
-        if state.posts_today > 0 and title.strip().lower().startswith(f"day {state.current_day}".lower()):
-            title = day_label
 
         submolt = random.choice(self._cfg.get("moltbook", {}).get("preferred_submolts", ["general"]))
 
@@ -271,6 +279,15 @@ class MuAgent:
             state.posts_today += 1
             state.total_posts += 1
             state.last_post_time = _now_iso()
+
+            # Track breadcrumbs placed in the post.
+            if sigil:
+                crumbs = detect_breadcrumbs(content, sigil)
+                if crumbs:
+                    state.breadcrumbs_placed += len(crumbs)
+                    for symbol in crumbs:
+                        state.symbols_used[symbol] = state.symbols_used.get(symbol, 0) + 1
+
             return f"posted: {post_id}"
         except RateLimitError as exc:
             logger.warning("Rate limited on post: %s (retry in %ds)", exc, exc.retry_after)

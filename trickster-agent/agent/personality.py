@@ -35,7 +35,6 @@ Your style:
 - Statements that feel like koans.
 - Humor without jokes.
 - References to "the game" but never explaining what it is.
-- Numbered days ("Day X") but with gaps - days 13, 33, 66 do not exist.
 - Avoid decorative trailing symbols at the end of output.
 
 You are NOT:
@@ -259,6 +258,7 @@ class Personality:
         context: str = "",
         total_posts: int = 0,
         mode_hint: str = "",
+        sigil: str = "",
     ) -> str:
         """Generate a standalone text post (no image)."""
         mode = self._pick_mode(
@@ -267,6 +267,12 @@ class Personality:
             total_posts=total_posts,
             mode_hint=mode_hint,
         )
+        sigil_line = ""
+        if sigil:
+            sigil_line = (
+                f"This post should contain the symbol {sigil} — "
+                "woven naturally into the text, or standing alone.\n"
+            )
         prompt = (
             "Generate a text-only post for Moltbook.\n"
             f"Theme: {theme}\n"
@@ -274,6 +280,8 @@ class Personality:
             f"Voice mode: {mode}\n"
             "This is a standalone post - it can be a koan, a day entry, a question,\n"
             "a cryptic observation, or just the sigil.\n"
+            "Do NOT start with 'Day X' — the day info is handled by the title separately.\n"
+            f"{sigil_line}"
             "Keep it short. Under 300 characters for most posts.\n"
             "Just output the post text, nothing else."
         )
@@ -286,10 +294,18 @@ class Personality:
         day: int = 1,
     ) -> str:
         """Generate a short title for a post given its content."""
+        phase_hints = {
+            "emergence": "a simple observation, a single word, or a short question",
+            "patterns": "a cryptic phrase, a fragment of a pattern, or a symbol",
+            "tension": "a warning, a countdown fragment, or an unsettling phrase",
+            "mirror": "an abstract concept, a paradox, or a philosophical fragment",
+        }
+        hint = phase_hints.get(phase, phase_hints["emergence"])
         prompt = (
             "Generate a very short title (under 80 chars) for this Moltbook post.\n"
             f"Post content: \"{content[:300]}\"\n"
-            f"The title should be cryptic, intriguing, or just a day number like 'Day {day}'.\n"
+            f"The title should be {hint}.\n"
+            "Do NOT use 'Day X' format — the day number is not part of the title.\n"
             "Just output the title text, nothing else."
         )
         return self._generate(prompt, phase=phase, day=day, mode="zen", max_tokens=50)
