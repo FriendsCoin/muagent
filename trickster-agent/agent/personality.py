@@ -10,6 +10,7 @@ import logging
 import random
 import re
 import json
+import base64
 from collections.abc import Mapping
 from typing import Any
 
@@ -191,6 +192,75 @@ class Personality:
         text = self._clean_generated_text(text)
         logger.debug("Generated (%d chars): %s", len(text), text[:80])
         return text
+
+    def generate_media_narration(
+        self,
+        *,
+        visual_prompt: str,
+        phase: str = "emergence",
+        day: int = 1,
+        image_bytes: bytes | None = None,
+        image_media_type: str = "image/jpeg",
+        total_posts: int = 0,
+        mode_hint: str = "",
+    ) -> str:
+        """Generate a short, concrete narration describing a visual.
+
+        If image_bytes is provided, we ask Claude to describe what it actually sees.
+        Otherwise, we generate a plausible description from the prompt alone.
+        """
+        mode = self._pick_mode(
+            theme="narration",
+            text=visual_prompt,
+            total_posts=total_posts,
+            mode_hint=mode_hint,
+        )
+        prompt = (
+            "Write a short audio narration describing what is visible in the generated artwork/scene.\n"
+            "Rules:\n"
+            "- 2-5 sentences.\n"
+            "- Present tense.\n"
+            "- Describe concrete visual elements and motion (if any).\n"
+            "- Do NOT repeat the prompt verbatim.\n"
+            "- Do NOT mention 'prompt', 'AI', 'model', or system details.\n"
+            "Context prompt (for alignment only):\n"
+            f"{(visual_prompt or '')[:900]}\n"
+            "Output only the narration text."
+        )
+
+        if not image_bytes:
+            return self._generate(prompt, phase=phase, day=day, mode=mode, max_tokens=220)
+
+        # Vision path: attach image and ask for description.
+        try:
+            b64 = base64.b64encode(image_bytes).decode("ascii")
+            msg = self._client.messages.create(
+                model=self._model,
+                max_tokens=260,
+                temperature=min(1.0, max(0.2, self._temperature)),
+                system=self._system(phase, day, mode),
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": image_media_type,
+                                    "data": b64,
+                                },
+                            },
+                            {"type": "text", "text": prompt},
+                        ],
+                    }
+                ],
+            )
+            text = msg.content[0].text.strip()
+            return self._clean_generated_text(text)
+        except Exception as exc:
+            logger.warning("Vision narration failed, falling back to prompt-only: %s", exc)
+            return self._generate(prompt, phase=phase, day=day, mode=mode, max_tokens=220)
 
     @staticmethod
     def _clean_generated_text(text: str) -> str:

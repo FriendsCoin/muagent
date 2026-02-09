@@ -116,6 +116,8 @@ visual_posting:
   mode_weights:
     url: 0.65
     ascii: 0.35
+    audio: 0.00
+    video: 0.00
 
   url:
     # provider: "pollinations" | "pollinations_enter" | "runware"
@@ -138,6 +140,15 @@ visual_posting:
     width: 42
     height: 14
     add_code_fence: true
+
+  # Optional media links (Pollinations)
+  media:
+    pollinations_endpoint: "https://gen.pollinations.ai"
+    audio_voice: "alloy"
+    video_model: "fast"
+    # WARNING: if true, generated audio/video URLs may include POLLINATIONS_API_KEY in the URL.
+    # Keep this false for public posts.
+    public_url_include_key: false
 
 # NFT drafts + optional mint adapter (objkt via webhook worker)
 nft:

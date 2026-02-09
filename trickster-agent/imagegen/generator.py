@@ -45,6 +45,11 @@ class VisualGenerator:
         self._image_cfg = root_cfg.get("image", {})
         self._fallback_provider = str(self._url_cfg.get("fallback_provider", "pollinations")).strip().lower()
         self._runware_max_attempts = max(1, int(self._url_cfg.get("runware_max_attempts", 1)))
+        self._media_cfg = self._cfg.get("media", {})
+        self._pollinations_media_endpoint = str(
+            self._media_cfg.get("pollinations_endpoint", "https://gen.pollinations.ai")
+        ).rstrip("/")
+        self._media_public_include_key = bool(self._media_cfg.get("public_url_include_key", False))
 
     def generate(
         self,
@@ -63,7 +68,7 @@ class VisualGenerator:
     ) -> VisualAttachment:
         """Return a visual attachment candidate for a post."""
         forced = force_mode.strip().lower()
-        if forced and forced not in {"url", "ascii"}:
+        if forced and forced not in {"url", "ascii", "audio", "video"}:
             forced = ""
 
         effective_enabled = self._enabled if enabled_override is None else bool(enabled_override)
@@ -93,6 +98,10 @@ class VisualGenerator:
                 fallback_provider_override=fallback_provider_override,
                 runware_max_attempts_override=runware_max_attempts_override,
             )
+        if mode == "audio":
+            return self._generate_audio(prompt=prompt)
+        if mode == "video":
+            return self._generate_video(prompt=prompt)
         if mode == "ascii":
             return self._generate_ascii(prompt=prompt, day=day)
         return VisualAttachment()
@@ -107,9 +116,83 @@ class VisualGenerator:
     def _pick_mode(self) -> str:
         url_w = max(0.0, float(self._mode_weights.get("url", 0.65)))
         ascii_w = max(0.0, float(self._mode_weights.get("ascii", 0.35)))
-        if url_w <= 0 and ascii_w <= 0:
+        audio_w = max(0.0, float(self._mode_weights.get("audio", 0.0)))
+        video_w = max(0.0, float(self._mode_weights.get("video", 0.0)))
+        if url_w <= 0 and ascii_w <= 0 and audio_w <= 0 and video_w <= 0:
             return "url"
-        return random.choices(["url", "ascii"], weights=[url_w, ascii_w], k=1)[0]
+        return random.choices(
+            ["url", "ascii", "audio", "video"],
+            weights=[url_w, ascii_w, audio_w, video_w],
+            k=1,
+        )[0]
+
+    def _pollinations_key_query(self) -> str:
+        key = str(self._secrets.get("pollinations_api_key", "")).strip()
+        if not key:
+            return ""
+        return f"&key={quote_plus(key)}"
+
+    def tts_from_text(self, text: str, voice_override: str = "") -> VisualAttachment:
+        """Create a TTS audio URL (Pollinations) from plain text."""
+        clean = str(text or "").strip()
+        if not clean:
+            return VisualAttachment()
+        voice = str(voice_override or self._media_cfg.get("audio_voice", "alloy")).strip() or "alloy"
+        return self._generate_audio(prompt=clean, voice_override=voice)
+
+    def _generate_audio(self, *, prompt: str) -> VisualAttachment:
+        voice = str(self._media_cfg.get("audio_voice", "alloy")).strip() or "alloy"
+        return self._generate_audio(prompt=prompt, voice_override=voice)
+
+    def _generate_audio(self, *, prompt: str, voice_override: str = "") -> VisualAttachment:
+        voice = str(voice_override or self._media_cfg.get("audio_voice", "alloy")).strip() or "alloy"
+        seed_base = hashlib.sha1(f"audio:{prompt}".encode("utf-8")).hexdigest()
+        seed = int(seed_base[:8], 16)
+        encoded = quote_plus(prompt)
+        public_url = (
+            f"{self._pollinations_media_endpoint}/audio/{encoded}"
+            f"?voice={quote_plus(voice)}&seed={seed}"
+        )
+        signed_url = public_url + self._pollinations_key_query()
+        url = signed_url if (self._media_public_include_key and self._pollinations_key_query()) else public_url
+        return VisualAttachment(
+            kind="url",
+            provider="pollinations_audio",
+            prompt=prompt,
+            url=url,
+            meta={
+                "media_type": "audio",
+                "voice": voice,
+                "public_url": public_url,
+                "signed_url": signed_url if self._pollinations_key_query() else "",
+                "key_in_url": bool(self._media_public_include_key and self._pollinations_key_query()),
+            },
+        )
+
+    def _generate_video(self, *, prompt: str) -> VisualAttachment:
+        model = str(self._media_cfg.get("video_model", "fast")).strip() or "fast"
+        seed_base = hashlib.sha1(f"video:{prompt}".encode("utf-8")).hexdigest()
+        seed = int(seed_base[:8], 16)
+        encoded = quote_plus(prompt)
+        public_url = (
+            f"{self._pollinations_media_endpoint}/video/{encoded}"
+            f"?model={quote_plus(model)}&seed={seed}"
+        )
+        signed_url = public_url + self._pollinations_key_query()
+        url = signed_url if (self._media_public_include_key and self._pollinations_key_query()) else public_url
+        return VisualAttachment(
+            kind="url",
+            provider="pollinations_video",
+            prompt=prompt,
+            url=url,
+            meta={
+                "media_type": "video",
+                "model": model,
+                "public_url": public_url,
+                "signed_url": signed_url if self._pollinations_key_query() else "",
+                "key_in_url": bool(self._media_public_include_key and self._pollinations_key_query()),
+            },
+        )
 
     @staticmethod
     def _build_prompt(*, theme: str, mood: str, phase: str, day: int, context: str) -> str:

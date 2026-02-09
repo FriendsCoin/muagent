@@ -19,6 +19,7 @@ import asyncio
 import sys
 import time
 import uuid
+import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -496,7 +497,7 @@ class AdminContext:
             enabled = bool(self.cfg.get("visual_posting", {}).get("enabled", False))
 
         mode = str(flags.get("visual_mode", "auto")).strip().lower() or "auto"
-        if mode not in {"auto", "url", "ascii", "off"}:
+        if mode not in {"auto", "url", "ascii", "audio", "video", "off"}:
             mode = "auto"
 
         provider = str(flags.get("visual_url_provider", "")).strip().lower()
@@ -755,6 +756,9 @@ class AdminContext:
         day: int = 1,
     ) -> dict[str, Any]:
         generator = VisualGenerator(self.cfg)
+        if mode in {"audio", "video"}:
+            return self.test_media_narration(prompt=prompt, mode=mode, phase=phase, day=day)
+
         force_mode = mode if mode in {"url", "ascii"} else ""
         effective = self._visual_effective_flags()
         visual = generator.generate(
@@ -782,6 +786,84 @@ class AdminContext:
             "mode": mode,
         }
         return payload
+
+    @staticmethod
+    def _guess_image_media_type(data: bytes) -> str:
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if data.startswith(b"\xff\xd8"):
+            return "image/jpeg"
+        return "image/jpeg"
+
+    def test_media_narration(
+        self,
+        *,
+        prompt: str,
+        mode: str,
+        phase: str = "emergence",
+        day: int = 1,
+    ) -> dict[str, Any]:
+        """Generate an image/video + narrated audio (TTS) instead of reading the prompt verbatim."""
+        generator = VisualGenerator(self.cfg)
+        effective = self._visual_effective_flags()
+
+        base_force = "url" if mode == "audio" else "video"
+        base_visual = generator.generate(
+            theme=prompt[:80] or "mystery",
+            mood="soft_ominous",
+            phase=phase or "emergence",
+            day=max(1, int(day)),
+            context=prompt,
+            force_mode=base_force,
+            enabled_override=effective["enabled"],
+            attach_probability_override=1.0,
+            url_provider_override=str(effective["url_provider"] or ""),
+            fallback_provider_override=str(effective.get("fallback_provider") or ""),
+            runware_max_attempts_override=effective.get("runware_max_attempts_override"),
+        )
+
+        image_bytes: bytes | None = None
+        image_media_type = "image/jpeg"
+        if base_force == "url" and base_visual.url.startswith("http"):
+            try:
+                import httpx
+
+                r = httpx.get(base_visual.url, timeout=12)
+                if r.status_code == 200 and r.content and len(r.content) <= 1_200_000:
+                    image_bytes = bytes(r.content)
+                    image_media_type = self._guess_image_media_type(image_bytes)
+            except Exception:
+                image_bytes = None
+
+        narration = self.personality().generate_media_narration(
+            visual_prompt=base_visual.prompt or prompt,
+            phase=phase or "emergence",
+            day=max(1, int(day)),
+            image_bytes=image_bytes,
+            image_media_type=image_media_type,
+        )
+        audio = generator.tts_from_text(narration)
+
+        return {
+            "mode": mode,
+            "phase": phase,
+            "day": day,
+            "base_visual": {
+                "kind": base_visual.kind,
+                "provider": base_visual.provider,
+                "prompt": base_visual.prompt,
+                "url": base_visual.url,
+                "meta": base_visual.meta,
+            },
+            "narration": narration,
+            "audio": {
+                "kind": audio.kind,
+                "provider": audio.provider,
+                "prompt": audio.prompt,
+                "url": audio.url,
+                "meta": audio.meta,
+            },
+        }
 
     def _nft_effective_flags(self) -> dict[str, Any]:
         flags = self.get_control_flags()
@@ -1548,7 +1630,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             fallback_provider = str(body.get("fallback_provider", "")).strip().lower()
             runware_attempts_raw = str(body.get("runware_max_attempts", "")).strip()
             attach_probability_raw = str(body.get("attach_probability", "")).strip()
-            if mode not in {"auto", "url", "ascii", "off"}:
+            if mode not in {"auto", "url", "ascii", "audio", "video", "off"}:
                 self._send_json(400, {"error": "invalid_mode"})
                 return
             if provider and provider not in {"pollinations", "pollinations_enter", "runware"}:
@@ -1603,7 +1685,7 @@ class AdminHandler(BaseHTTPRequestHandler):
                 day = int(body.get("day", 1))
             except (TypeError, ValueError):
                 day = 1
-            if mode not in {"auto", "url", "ascii"}:
+            if mode not in {"auto", "url", "ascii", "audio", "video"}:
                 self._send_json(400, {"error": "invalid_mode"})
                 return
             payload = self.ctx.test_visual_generation(
@@ -1796,6 +1878,8 @@ _INDEX_HTML = """<!doctype html>
             <option value="auto" selected>auto</option>
             <option value="url">url</option>
             <option value="ascii">ascii</option>
+            <option value="audio">audio</option>
+            <option value="video">video</option>
             <option value="off">off</option>
           </select>
           <label class="muted">provider</label>
@@ -1830,8 +1914,12 @@ _INDEX_HTML = """<!doctype html>
             <option value="auto" selected>auto test</option>
             <option value="url">force url</option>
             <option value="ascii">force ascii</option>
+            <option value="audio">force audio</option>
+            <option value="video">force video</option>
           </select>
           <button onclick="testVisual()">Test Visual</button>
+          <button onclick="testAudio()">Test Audio</button>
+          <button onclick="testVideo()">Test Video</button>
         </div>
         <div id="visualSummary" class="kv"></div>
         <div id="visualResult" class="mono muted">No visual test yet.</div>
@@ -2358,9 +2446,9 @@ _INDEX_HTML = """<!doctype html>
       document.getElementById('visualResult').textContent = JSON.stringify(d, null, 2);
       await refreshAll();
     }
-    async function testVisual() {
+    async function runVisualTest(modeOverride='') {
       const prompt = document.getElementById('visualTestPrompt').value.trim();
-      const mode = document.getElementById('visualTestMode').value;
+      const mode = modeOverride || document.getElementById('visualTestMode').value;
       const status = await apiGet('/api/status');
       const state = status.state || {};
       const payload = {
@@ -2374,6 +2462,9 @@ _INDEX_HTML = """<!doctype html>
       await refreshVisualStatus();
       await refreshVisualWhy();
     }
+    async function testVisual() { await runVisualTest(''); }
+    async function testAudio() { await runVisualTest('audio'); }
+    async function testVideo() { await runVisualTest('video'); }
     async function saveNftConfig() {
       const enabled = document.getElementById('nftEnabled').checked;
       const mode = document.getElementById('nftMode').value;

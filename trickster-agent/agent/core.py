@@ -11,6 +11,7 @@ import logging
 import random
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from imagegen import VisualGenerator
 from moltbook.client import MoltbookClient, RateLimitError
@@ -49,6 +50,14 @@ def _truncate_text(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _guess_image_media_type(data: bytes) -> str:
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith(b"\xff\xd8"):
+        return "image/jpeg"
+    return "image/jpeg"
 
 
 def _dedupe_keep_order(items: list[str]) -> list[str]:
@@ -310,10 +319,14 @@ class MuAgent:
         if visual_mode_flag in {"off", "none", "disable", "disabled"}:
             force_visual_mode = ""
             visual_enabled_override = False
-        elif visual_mode_flag in {"url", "ascii"}:
+        elif visual_mode_flag in {"url", "ascii", "audio", "video"}:
             force_visual_mode = visual_mode_flag
         elif any(token in instruction_low for token in ("ascii", "asci", "text-art", "text art")):
             force_visual_mode = "ascii"
+        elif any(token in instruction_low for token in ("audio", "voice", "podcast", "sound")):
+            force_visual_mode = "audio"
+        elif any(token in instruction_low for token in ("video", "clip", "animation")):
+            force_visual_mode = "video"
         elif any(
             token in instruction_low
             for token in ("image", "img", "illustration", "render", "artwork")
@@ -350,6 +363,54 @@ class MuAgent:
             fallback_provider_override=visual_fallback_provider_flag,
             runware_max_attempts_override=visual_runware_attempts_override,
         )
+
+        # If audio/video was requested, do not "read the prompt" via TTS.
+        # Instead: generate a base visual, then narrate it, then TTS that narration.
+        requested_media_type = str((visual.meta or {}).get("media_type", "")).strip().lower()
+        media_requested = force_visual_mode in {"audio", "video"} or requested_media_type in {"audio", "video"}
+        media_audio_url = ""
+        if media_requested:
+            base_force = "url" if (force_visual_mode == "audio" or requested_media_type == "audio") else "video"
+            base_visual = self._visual.generate(
+                theme=action.theme,
+                mood=action.visual_mood,
+                phase=state.current_phase,
+                day=state.current_day,
+                context=visual_context,
+                force_mode=base_force,
+                enabled_override=visual_enabled_override,
+                attach_probability_override=1.0,
+                url_provider_override=visual_provider_flag,
+                fallback_provider_override=visual_fallback_provider_flag,
+                runware_max_attempts_override=visual_runware_attempts_override,
+            )
+
+            image_bytes: bytes | None = None
+            image_media_type = "image/jpeg"
+            if base_force == "url" and base_visual.url.startswith("http"):
+                try:
+                    import httpx
+
+                    r = httpx.get(base_visual.url, timeout=12)
+                    if r.status_code == 200 and r.content and len(r.content) <= 1_200_000:
+                        image_bytes = bytes(r.content)
+                        image_media_type = _guess_image_media_type(image_bytes)
+                except Exception:
+                    image_bytes = None
+
+            narration = self._personality.generate_media_narration(
+                visual_prompt=base_visual.prompt or visual.prompt or action.theme,
+                phase=state.current_phase,
+                day=state.current_day,
+                image_bytes=image_bytes,
+                image_media_type=image_media_type,
+                total_posts=state.total_posts,
+            )
+            audio = self._visual.tts_from_text(narration)
+            media_audio_url = str(audio.url or "").strip()
+
+            # Swap: keep the base visual as the post URL; add the audio narration link to the content.
+            visual = base_visual
         if visual.kind != "none":
             requested_url_provider = (
                 visual_provider_flag
@@ -431,6 +492,20 @@ class MuAgent:
                     "fallback_provider_used": fallback_provider_used,
                 },
             )
+            if media_audio_url:
+                # Avoid persisting key-bearing URLs in the DB.
+                safe_audio_url = str(media_audio_url).split("&key=", 1)[0]
+                await db.log_narrative_event(
+                    "media_narration_generated",
+                    "generated audio narration for visual",
+                    metadata={
+                        "audio_url": _truncate_text(safe_audio_url, 600),
+                        "base_visual_url": _truncate_text(str(visual.url or ""), 600),
+                        "provider": str(visual.provider or ""),
+                        "phase": state.current_phase,
+                        "day": state.current_day,
+                    },
+                )
         post_content = content
         post_url: str | None = None
         image_path = ""
@@ -440,6 +515,8 @@ class MuAgent:
         elif visual.kind == "url" and visual.url:
             post_url = visual.url
             image_path = visual.url
+            if media_audio_url:
+                post_content = f"{post_content}\n\nAudio narration: {media_audio_url}".strip()
 
         title = self._personality.generate_post_title(
             content=post_content,

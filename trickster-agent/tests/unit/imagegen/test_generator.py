@@ -107,3 +107,37 @@ def test_visual_generator_pollinations_enter_without_key_falls_back_to_public_ur
     assert visual.provider in {"pollinations", "pollinations_fallback"}
     assert visual.meta.get("pollinations_enter_fallback_used") is True
     assert visual.meta.get("pollinations_enter_error_reason") == "no_key"
+
+
+def test_visual_generator_audio_mode():
+    cfg = {
+        "_secrets": {"pollinations_api_key": "abc123"},
+        "visual_posting": {
+            "enabled": True,
+            "attach_probability": {"emergence": 1.0},
+            "mode_weights": {"url": 0.0, "ascii": 0.0, "audio": 1.0, "video": 0.0},
+            "media": {"pollinations_endpoint": "https://gen.pollinations.ai", "audio_voice": "nova"},
+        },
+    }
+    gen = VisualGenerator(cfg)
+    visual = gen.generate(theme="voice", mood="soft_ominous", phase="emergence", day=2)
+    assert visual.kind == "url"
+    assert visual.provider == "pollinations_audio"
+    assert "/audio/" in visual.url
+    assert "voice=nova" in visual.url
+    assert "key=abc123" not in visual.url
+    assert "key=abc123" in str((visual.meta or {}).get("signed_url", ""))
+
+
+def test_visual_generator_video_force_mode_works_even_when_disabled():
+    gen = VisualGenerator({"visual_posting": {"enabled": False}})
+    visual = gen.generate(
+        theme="void",
+        mood="soft_ominous",
+        phase="emergence",
+        day=2,
+        force_mode="video",
+    )
+    assert visual.kind == "url"
+    assert visual.provider == "pollinations_video"
+    assert "/video/" in visual.url
