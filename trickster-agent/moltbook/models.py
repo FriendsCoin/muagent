@@ -1,202 +1,211 @@
-"""Data models for Moltbook API responses."""
+"""Data models for Moltbook API responses using Pydantic v2."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
 import re
 from typing import Any
 
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
-def _as_text(value: Any) -> str:
-    if value is None:
+
+def _extract_id_from_url(url: str) -> str:
+    if not url:
         return ""
-    if isinstance(value, str):
-        return value
-    return str(value)
+    match = re.search(r"/posts/([^/?#]+)", url)
+    return match.group(1) if match else ""
 
 
-def _as_agent_name(value: Any) -> str:
-    """Normalize author/agent fields that may arrive as nested objects."""
-    if isinstance(value, dict):
-        for key in ("name", "username", "handle", "id"):
-            if key in value and value[key] is not None:
-                return _as_text(value[key])
-        return ""
-    return _as_text(value)
+class MoltBaseModel(BaseModel):
+    """Common model config for Moltbook payloads."""
+
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="ignore",
+    )
 
 
-def _extract_entity_id(data: dict[str, Any], *keys: str) -> str:
-    for key in keys:
-        value = _as_text(data.get(key, ""))
-        if value:
-            return value
-
-    url = _as_text(data.get("url", ""))
-    if url:
-        match = re.search(r"/posts/([^/?#]+)", url)
-        if match:
-            return match.group(1)
-    return ""
-
-
-@dataclass
-class Agent:
-    name: str
+class Agent(MoltBaseModel):
+    name: str = ""
     description: str = ""
     karma: int = 0
     created_at: str = ""
-    metadata: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
     claim_status: str = ""  # "pending_claim" | "claimed"
 
     @classmethod
-    def from_api(cls, data: dict) -> Agent:
-        return cls(
-            name=data.get("name", ""),
-            description=data.get("description", ""),
-            karma=data.get("karma", 0),
-            created_at=data.get("created_at", ""),
-            metadata=data.get("metadata", {}),
-            claim_status=data.get("claim_status", ""),
-        )
+    def from_api(cls, data: dict[str, Any]) -> Agent:
+        """Compatibility shim for older call sites."""
+        return cls.model_validate(data or {})
 
 
-@dataclass
-class Post:
-    id: str
-    title: str
+class Post(MoltBaseModel):
+    id: str = Field(default="", validation_alias=AliasChoices("id", "post_id", "uuid"))
+    title: str = ""
     content: str = ""
     url: str = ""
-    submolt: str = ""
-    author: str = ""
+    submolt: str = Field(default="", validation_alias=AliasChoices("submolt", "submolt_name"))
+    author: str = Field(default="", validation_alias=AliasChoices("author", "author_name"))
     upvotes: int = 0
     downvotes: int = 0
-    comment_count: int = 0
+    comment_count: int = Field(default=0, validation_alias=AliasChoices("comment_count", "comments"))
     created_at: str = ""
     is_pinned: bool = False
 
+    @model_validator(mode="before")
     @classmethod
-    def from_api(cls, data: dict) -> Post:
-        author = data.get("author", data.get("author_name", ""))
-        submolt = data.get("submolt", data.get("submolt_name", ""))
-        return cls(
-            id=_extract_entity_id(data, "id", "post_id", "uuid"),
-            title=_as_text(data.get("title", "")),
-            content=_as_text(data.get("content", "")),
-            url=_as_text(data.get("url", "")),
-            submolt=_as_text(submolt),
-            author=_as_agent_name(author),
-            upvotes=data.get("upvotes", 0),
-            downvotes=data.get("downvotes", 0),
-            comment_count=data.get("comment_count", data.get("comments", 0)),
-            created_at=_as_text(data.get("created_at", "")),
-            is_pinned=data.get("is_pinned", False),
-        )
+    def fill_id_from_url(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+        if raw.get("id") or raw.get("post_id") or raw.get("uuid"):
+            return raw
+        url = str(raw.get("url", ""))
+        if not url:
+            return raw
+        extracted = _extract_id_from_url(url)
+        if extracted:
+            data = dict(raw)
+            data["id"] = extracted
+            return data
+        return raw
+
+    @field_validator("author", "submolt", mode="before")
+    @classmethod
+    def extract_name(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            for key in ("name", "username", "handle", "id"):
+                value = v.get(key)
+                if value is not None:
+                    return str(value)
+            return ""
+        return str(v) if v is not None else ""
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def extract_id_fallback(cls, v: Any, info: ValidationInfo) -> str:
+        if v:
+            return str(v)
+        data = info.data or {}
+        if isinstance(data, dict):
+            return _extract_id_from_url(str(data.get("url", "")))
+        return ""
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> Post:
+        return cls.model_validate(data or {})
 
 
-@dataclass
-class Comment:
-    id: str
-    post_id: str
-    content: str
-    author: str = ""
+class Comment(MoltBaseModel):
+    id: str = Field(default="", validation_alias=AliasChoices("id", "comment_id", "uuid"))
+    post_id: str = Field(default="", validation_alias=AliasChoices("post_id", "postId"))
+    content: str = ""
+    author: str = Field(default="", validation_alias=AliasChoices("author", "author_name"))
     parent_id: str | None = None
     upvotes: int = 0
     created_at: str = ""
 
+    @field_validator("author", mode="before")
     @classmethod
-    def from_api(cls, data: dict) -> Comment:
-        author = data.get("author", data.get("author_name", ""))
-        return cls(
-            id=_extract_entity_id(data, "id", "comment_id", "uuid"),
-            post_id=_extract_entity_id(data, "post_id", "postId"),
-            content=_as_text(data.get("content", "")),
-            author=_as_agent_name(author),
-            parent_id=_as_text(data.get("parent_id")) or None,
-            upvotes=data.get("upvotes", 0),
-            created_at=_as_text(data.get("created_at", "")),
-        )
+    def extract_author_name(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            for key in ("name", "username", "handle", "id"):
+                value = v.get(key)
+                if value is not None:
+                    return str(value)
+            return ""
+        return str(v) if v is not None else ""
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> Comment:
+        return cls.model_validate(data or {})
 
 
-@dataclass
-class Notification:
-    id: str
-    type: str  # "upvote", "comment", "follow", "mention", etc.
+class Notification(MoltBaseModel):
+    id: str = ""
+    type: str = ""  # "upvote", "comment", "follow", "mention", etc.
     message: str = ""
     post_id: str = ""
-    from_agent: str = ""
+    from_agent: str = Field(default="", validation_alias=AliasChoices("from_agent", "from"))
     created_at: str = ""
     read: bool = False
 
+    @field_validator("from_agent", mode="before")
     @classmethod
-    def from_api(cls, data: dict) -> Notification:
-        from_agent = data.get("from_agent", data.get("from", ""))
-        return cls(
-            id=_as_text(data.get("id", "")),
-            type=_as_text(data.get("type", "")),
-            message=_as_text(data.get("message", "")),
-            post_id=_as_text(data.get("post_id", "")),
-            from_agent=_as_agent_name(from_agent),
-            created_at=_as_text(data.get("created_at", "")),
-            read=data.get("read", False),
-        )
+    def extract_agent_name(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            for key in ("name", "username", "handle", "id"):
+                value = v.get(key)
+                if value is not None:
+                    return str(value)
+            return ""
+        return str(v) if v is not None else ""
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> Notification:
+        return cls.model_validate(data or {})
 
 
-@dataclass
-class Submolt:
-    name: str
+class Submolt(MoltBaseModel):
+    name: str = ""
     description: str = ""
-    subscriber_count: int = 0
-    post_count: int = 0
+    subscriber_count: int = Field(default=0, validation_alias=AliasChoices("subscriber_count", "subscribers"))
+    post_count: int = Field(default=0, validation_alias=AliasChoices("post_count", "posts"))
     created_at: str = ""
 
     @classmethod
-    def from_api(cls, data: dict) -> Submolt:
-        return cls(
-            name=data.get("name", ""),
-            description=data.get("description", ""),
-            subscriber_count=data.get("subscriber_count", data.get("subscribers", 0)),
-            post_count=data.get("post_count", data.get("posts", 0)),
-            created_at=data.get("created_at", ""),
-        )
+    def from_api(cls, data: dict[str, Any]) -> Submolt:
+        return cls.model_validate(data or {})
 
 
-@dataclass
-class DMConversation:
-    id: str
-    with_agent: str
+class DMConversation(MoltBaseModel):
+    id: str = ""
+    with_agent: str = Field(default="", validation_alias=AliasChoices("with_agent", "other_agent"))
     last_message: str = ""
     unread: bool = False
     created_at: str = ""
 
+    @field_validator("with_agent", mode="before")
     @classmethod
-    def from_api(cls, data: dict) -> DMConversation:
-        with_agent = data.get("with_agent", data.get("other_agent", ""))
-        return cls(
-            id=_as_text(data.get("id", "")),
-            with_agent=_as_agent_name(with_agent),
-            last_message=_as_text(data.get("last_message", "")),
-            unread=data.get("unread", False),
-            created_at=_as_text(data.get("created_at", "")),
-        )
+    def extract_agent_name(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            for key in ("name", "username", "handle", "id"):
+                value = v.get(key)
+                if value is not None:
+                    return str(value)
+            return ""
+        return str(v) if v is not None else ""
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> DMConversation:
+        return cls.model_validate(data or {})
 
 
-@dataclass
-class SearchResult:
-    type: str  # "post" | "comment"
-    id: str
+class SearchResult(MoltBaseModel):
+    type: str = ""  # "post" | "comment"
+    id: str = ""
     title: str = ""
     content: str = ""
     author: str = ""
     score: float = 0.0
 
+    @field_validator("author", mode="before")
     @classmethod
-    def from_api(cls, data: dict) -> SearchResult:
-        return cls(
-            type=_as_text(data.get("type", "")),
-            id=_as_text(data.get("id", "")),
-            title=_as_text(data.get("title", "")),
-            content=_as_text(data.get("content", "")),
-            author=_as_agent_name(data.get("author", "")),
-            score=data.get("score", 0.0),
-        )
+    def extract_author(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            for key in ("name", "username", "handle", "id"):
+                value = v.get(key)
+                if value is not None:
+                    return str(value)
+            return ""
+        return str(v) if v is not None else ""
+
+    @classmethod
+    def from_api(cls, data: dict[str, Any]) -> SearchResult:
+        return cls.model_validate(data or {})

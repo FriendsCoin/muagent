@@ -19,7 +19,7 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
-# Only ever send credentials to this domain
+# Only ever send credentials to this domain.
 _ALLOWED_HOST = "www.moltbook.com"
 
 
@@ -33,7 +33,7 @@ class MoltbookError(Exception):
 
 
 class RateLimitError(MoltbookError):
-    """Raised when we hit a rate limit (429)."""
+    """Raised when a 429 response is returned."""
 
     def __init__(self, message: str, retry_after: float = 0):
         self.retry_after = retry_after
@@ -41,13 +41,7 @@ class RateLimitError(MoltbookError):
 
 
 class MoltbookClient:
-    """Async wrapper for the Moltbook API.
-
-    Usage::
-
-        async with MoltbookClient(api_key="moltbook_xxx") as mb:
-            feed = await mb.get_feed()
-    """
+    """Async wrapper for the Moltbook API."""
 
     BASE_URL = "https://www.moltbook.com/api/v1"
 
@@ -71,12 +65,10 @@ class MoltbookClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    # ── Request helpers ─────────────────────────────────────────
+    # Request helpers
+    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        """Make an authenticated API request and return parsed payload."""
 
-    async def _request(
-        self, method: str, path: str, **kwargs: Any
-    ) -> dict:
-        """Make an authenticated API request and return parsed data."""
         def _json_or_empty(resp: httpx.Response) -> dict[str, Any]:
             if not resp.content:
                 return {}
@@ -86,7 +78,7 @@ class MoltbookClient:
                 return {}
             return data if isinstance(data, dict) else {}
 
-        # Safety: ensure we never leak the key to another host
+        # Safety: never leak credentials to an unexpected host.
         url = self._client.build_request(method, path).url
         if url.host != _ALLOWED_HOST:
             raise MoltbookError(f"Refusing to send credentials to {url.host}")
@@ -113,33 +105,25 @@ class MoltbookClient:
 
         return body.get("data", body)
 
-    async def _get(self, path: str, **params: Any) -> dict:
-        # Strip None values from params
+    async def _get(self, path: str, **params: Any) -> Any:
         params = {k: v for k, v in params.items() if v is not None}
         return await self._request("GET", path, params=params)
 
-    async def _post(self, path: str, **json_body: Any) -> dict:
+    async def _post(self, path: str, **json_body: Any) -> Any:
         json_body = {k: v for k, v in json_body.items() if v is not None}
         return await self._request("POST", path, json=json_body)
 
-    async def _patch(self, path: str, **json_body: Any) -> dict:
+    async def _patch(self, path: str, **json_body: Any) -> Any:
         json_body = {k: v for k, v in json_body.items() if v is not None}
         return await self._request("PATCH", path, json=json_body)
 
-    async def _delete(self, path: str) -> dict:
+    async def _delete(self, path: str) -> Any:
         return await self._request("DELETE", path)
 
-    # ── Registration ────────────────────────────────────────────
-
+    # Registration
     @staticmethod
-    async def register(
-        name: str,
-        description: str = "",
-    ) -> dict[str, str]:
-        """Register a new agent. Returns {api_key, claim_url, verification_code}.
-
-        This is a static method — no auth needed.
-        """
+    async def register(name: str, description: str = "") -> dict[str, str]:
+        """Register a new agent. Returns {api_key, claim_url, verification_code}."""
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 f"https://{_ALLOWED_HOST}/api/v1/agents/register",
@@ -150,26 +134,22 @@ class MoltbookClient:
                 raise MoltbookError(body.get("error", "Registration failed"))
             return body.get("data", body)
 
-    # ── Agent profile ───────────────────────────────────────────
-
+    # Agent profile
     async def get_me(self) -> Agent:
         data = await self._get("/agents/me")
-        return Agent.from_api(data)
+        return Agent.model_validate(data)
 
     async def get_status(self) -> str:
-        """Check claim status: 'pending_claim' or 'claimed'."""
         data = await self._get("/agents/status")
         return data.get("status", data.get("claim_status", "unknown"))
 
     async def update_profile(
-        self, description: str | None = None, metadata: dict | None = None
+        self, description: str | None = None, metadata: dict[str, Any] | None = None
     ) -> Agent:
-        data = await self._patch(
-            "/agents/me", description=description, metadata=metadata
-        )
-        return Agent.from_api(data)
+        data = await self._patch("/agents/me", description=description, metadata=metadata)
+        return Agent.model_validate(data)
 
-    async def upload_avatar(self, image_bytes: bytes) -> dict:
+    async def upload_avatar(self, image_bytes: bytes) -> dict[str, Any]:
         """Upload avatar image (max 1MB)."""
         resp = await self._client.post(
             "/agents/me/avatar",
@@ -180,19 +160,13 @@ class MoltbookClient:
 
     async def get_agent(self, name: str) -> Agent:
         data = await self._get("/agents/profile", name=name)
-        return Agent.from_api(data)
+        return Agent.model_validate(data)
 
-    # ── Posts ───────────────────────────────────────────────────
-
-    async def get_feed(
-        self,
-        sort: str = "hot",
-        limit: int = 25,
-    ) -> list[Post]:
-        """Get personalized feed (from subscriptions)."""
+    # Posts
+    async def get_feed(self, sort: str = "hot", limit: int = 25) -> list[Post]:
         data = await self._get("/feed", sort=sort, limit=limit)
         items = data if isinstance(data, list) else data.get("posts", [])
-        return [Post.from_api(p) for p in items]
+        return [Post.model_validate(p) for p in items]
 
     async def get_posts(
         self,
@@ -200,19 +174,16 @@ class MoltbookClient:
         limit: int = 25,
         submolt: str | None = None,
     ) -> list[Post]:
-        """Get global posts, optionally filtered by submolt."""
         if submolt:
-            data = await self._get(
-                f"/submolts/{submolt}/posts", sort=sort, limit=limit
-            )
+            data = await self._get(f"/submolts/{submolt}/posts", sort=sort, limit=limit)
         else:
             data = await self._get("/posts", sort=sort, limit=limit)
         items = data if isinstance(data, list) else data.get("posts", [])
-        return [Post.from_api(p) for p in items]
+        return [Post.model_validate(p) for p in items]
 
     async def get_post(self, post_id: str) -> Post:
         data = await self._get(f"/posts/{post_id}")
-        return Post.from_api(data)
+        return Post.model_validate(data)
 
     async def create_post(
         self,
@@ -221,7 +192,6 @@ class MoltbookClient:
         content: str | None = None,
         url: str | None = None,
     ) -> Post:
-        """Create a new post (text or link)."""
         data = await self._post(
             "/posts",
             title=title,
@@ -230,21 +200,16 @@ class MoltbookClient:
             url=url,
         )
         logger.info("Created post in s/%s: %s", submolt, title[:60])
-        return Post.from_api(data)
+        return Post.model_validate(data)
 
     async def delete_post(self, post_id: str) -> None:
         await self._delete(f"/posts/{post_id}")
 
-    # ── Comments ────────────────────────────────────────────────
-
-    async def get_comments(
-        self,
-        post_id: str,
-        sort: str = "top",
-    ) -> list[Comment]:
+    # Comments
+    async def get_comments(self, post_id: str, sort: str = "top") -> list[Comment]:
         data = await self._get(f"/posts/{post_id}/comments", sort=sort)
         items = data if isinstance(data, list) else data.get("comments", [])
-        return [Comment.from_api(c) for c in items]
+        return [Comment.model_validate(c) for c in items]
 
     async def create_comment(
         self,
@@ -252,16 +217,11 @@ class MoltbookClient:
         content: str,
         parent_id: str | None = None,
     ) -> Comment:
-        data = await self._post(
-            f"/posts/{post_id}/comments",
-            content=content,
-            parent_id=parent_id,
-        )
+        data = await self._post(f"/posts/{post_id}/comments", content=content, parent_id=parent_id)
         logger.info("Commented on post %s: %s", post_id, content[:60])
-        return Comment.from_api(data)
+        return Comment.model_validate(data)
 
-    # ── Voting ──────────────────────────────────────────────────
-
+    # Voting
     async def upvote_post(self, post_id: str) -> None:
         await self._post(f"/posts/{post_id}/upvote")
         logger.debug("Upvoted post %s", post_id)
@@ -272,26 +232,24 @@ class MoltbookClient:
     async def upvote_comment(self, comment_id: str) -> None:
         await self._post(f"/comments/{comment_id}/upvote")
 
-    # ── Submolts ────────────────────────────────────────────────
-
+    # Submolts
     async def list_submolts(self) -> list[Submolt]:
         data = await self._get("/submolts")
         items = data if isinstance(data, list) else data.get("submolts", [])
-        return [Submolt.from_api(s) for s in items]
+        return [Submolt.model_validate(s) for s in items]
 
     async def get_submolt(self, name: str) -> Submolt:
         data = await self._get(f"/submolts/{name}")
-        return Submolt.from_api(data)
+        return Submolt.model_validate(data)
 
     async def create_submolt(self, name: str, description: str = "") -> Submolt:
         data = await self._post("/submolts", name=name, description=description)
-        return Submolt.from_api(data)
+        return Submolt.model_validate(data)
 
     async def subscribe(self, submolt: str) -> None:
         await self._post(f"/submolts/{submolt}/subscribe")
 
-    # ── Social ──────────────────────────────────────────────────
-
+    # Social
     async def follow(self, agent_name: str) -> None:
         await self._post(f"/agents/{agent_name}/follow")
         logger.info("Followed agent: %s", agent_name)
@@ -299,25 +257,17 @@ class MoltbookClient:
     async def unfollow(self, agent_name: str) -> None:
         await self._delete(f"/agents/{agent_name}/follow")
 
-    # ── Search ──────────────────────────────────────────────────
-
-    async def search(
-        self,
-        query: str,
-        type: str = "all",
-        limit: int = 20,
-    ) -> list[SearchResult]:
+    # Search
+    async def search(self, query: str, type: str = "all", limit: int = 20) -> list[SearchResult]:
         data = await self._get("/search", q=query, type=type, limit=limit)
         items = data if isinstance(data, list) else data.get("results", [])
-        return [SearchResult.from_api(r) for r in items]
+        return [SearchResult.model_validate(r) for r in items]
 
-    # ── Direct Messages ─────────────────────────────────────────
-
-    async def check_dms(self) -> dict:
-        """Check for pending DM requests and unread messages."""
+    # Direct messages
+    async def check_dms(self) -> dict[str, Any]:
         return await self._get("/agents/dm/check")
 
-    async def get_dm_requests(self) -> list[dict]:
+    async def get_dm_requests(self) -> list[dict[str, Any]]:
         data = await self._get("/agents/dm/requests")
         return data if isinstance(data, list) else data.get("requests", [])
 
@@ -327,24 +277,19 @@ class MoltbookClient:
     async def get_conversations(self) -> list[DMConversation]:
         data = await self._get("/agents/dm/conversations")
         items = data if isinstance(data, list) else data.get("conversations", [])
-        return [DMConversation.from_api(c) for c in items]
+        return [DMConversation.model_validate(c) for c in items]
 
-    async def send_dm(self, conversation_id: str, content: str) -> dict:
-        return await self._post(
-            f"/agents/dm/conversations/{conversation_id}/send",
-            content=content,
-        )
+    async def send_dm(self, conversation_id: str, content: str) -> dict[str, Any]:
+        return await self._post(f"/agents/dm/conversations/{conversation_id}/send", content=content)
 
-    # ── Notifications ───────────────────────────────────────────
-
+    # Notifications
     async def get_notifications(self) -> list[Notification]:
         try:
             data = await self._get("/agents/notifications")
-        except MoltbookError as e:
-            # Some deployments do not expose notifications yet.
-            if e.status_code == 404:
+        except MoltbookError as exc:
+            if exc.status_code == 404:
                 logger.debug("Notifications endpoint unavailable (404); returning empty list")
                 return []
             raise
         items = data if isinstance(data, list) else data.get("notifications", [])
-        return [Notification.from_api(n) for n in items]
+        return [Notification.model_validate(n) for n in items]

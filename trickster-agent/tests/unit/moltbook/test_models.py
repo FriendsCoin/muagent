@@ -59,7 +59,7 @@ class TestPost:
             "submolt": {"name": "general"},
         })
         assert post.author == "ObjAuthor"
-        assert post.submolt == "{'name': 'general'}"
+        assert post.submolt == "general"
 
     def test_from_api_post_id_fallback(self):
         post = Post.from_api({"post_id": "fallback_post_id", "title": "t"})
