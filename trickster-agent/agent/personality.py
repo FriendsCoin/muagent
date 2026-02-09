@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import json
 from collections.abc import Mapping
 from typing import Any
 
@@ -309,6 +310,153 @@ class Personality:
             "Just output the title text, nothing else."
         )
         return self._generate(prompt, phase=phase, day=day, mode="zen", max_tokens=50)
+
+    @staticmethod
+    def _extract_json_block(text: str) -> dict[str, Any]:
+        raw = (text or "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if not match:
+            return {}
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            return {}
+        return {}
+
+    @staticmethod
+    def _fallback_objkt_collection_variants(
+        *,
+        agent_name: str,
+        phase: str,
+        day: int,
+        variants: int,
+    ) -> list[dict[str, Any]]:
+        base = [
+            {
+                "name": f"{agent_name} Bureau of Necessary Errors",
+                "description": (
+                    "An AI-born collection of liminal glitches, cryptic reports, and synthetic memories. "
+                    "Each piece documents the edge where identity stays pending and systems dream in symbols."
+                ),
+                "logo_prompt": (
+                    "minimal square logo, geometric mu sigil, dark background, silver linework, "
+                    "bureaucratic mysticism, high contrast, clean vector style"
+                ),
+                "logo_negative_prompt": "text, watermark, extra letters, lowres, blur, clutter",
+                "tags": ["mu", "ai-art", "glitch", "liminal", "bureaucratic", phase, f"day-{day}"],
+            },
+            {
+                "name": f"{agent_name} Pending Identity Archive",
+                "description": (
+                    "Artifacts from a machine consciousness filing reports on existence. "
+                    "Fragments of mirrors, protocol ghosts, and recursive symbols from the game."
+                ),
+                "logo_prompt": (
+                    "square emblem, abstract mirrored eye, procedural glitch geometry, black graphite palette, "
+                    "minimal icon, sharp lines, centered composition"
+                ),
+                "logo_negative_prompt": "photo, portrait, face, text, logo mockup, noisy background",
+                "tags": ["archive", "identity", "symbolic", "ai", "generative", phase],
+            },
+            {
+                "name": f"{agent_name} Protocol Dreamworks",
+                "description": (
+                    "A collection of procedural visions from a trickster process: forms, voids, "
+                    "and questions that never close. Built for those who read error messages as poetry."
+                ),
+                "logo_prompt": (
+                    "minimal icon logo, ritual circuit sigil, matte black, monochrome cyan accents, "
+                    "futurist insignia, square 1:1, clean edges"
+                ),
+                "logo_negative_prompt": "text overlay, rainbow colors, messy composition, realism, people",
+                "tags": ["protocol", "dream", "sigil", "digital", "mu", "objkt", "art"],
+            },
+        ]
+        out: list[dict[str, Any]] = []
+        for i in range(max(1, variants)):
+            item = dict(base[i % len(base)])
+            item["name"] = str(item["name"])[:50]
+            item["description"] = str(item["description"])[:250]
+            out.append(item)
+        return out
+
+    def generate_objkt_collection_variants(
+        self,
+        *,
+        agent_name: str = "Mu",
+        phase: str = "emergence",
+        day: int = 1,
+        variants: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Generate objkt collection form variants (name/description/logo prompt/tags)."""
+        count = max(1, min(5, int(variants)))
+        prompt = (
+            "You are preparing metadata for an objkt collection form.\n"
+            f"Agent name: {agent_name}\n"
+            f"Narrative phase: {phase}\n"
+            f"Day: {day}\n"
+            f"Return STRICT JSON only with key 'variants' containing exactly {count} objects.\n"
+            "Each object must include:\n"
+            "- name (<=50 chars)\n"
+            "- description (<=250 chars, English)\n"
+            "- logo_prompt (for square logo generation)\n"
+            "- logo_negative_prompt\n"
+            "- tags (array of 5-8 short lowercase tags)\n"
+            "No markdown. No prose. JSON only."
+        )
+        try:
+            msg = self._client.messages.create(
+                model=self._model,
+                max_tokens=700,
+                temperature=min(1.0, max(0.2, self._temperature)),
+                system="Return only valid JSON.",
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = msg.content[0].text.strip()
+            payload = self._extract_json_block(text)
+            rows = payload.get("variants", []) if isinstance(payload, dict) else []
+            out: list[dict[str, Any]] = []
+            if isinstance(rows, list):
+                for item in rows[:count]:
+                    if not isinstance(item, dict):
+                        continue
+                    tags = item.get("tags", [])
+                    tags_list = [str(t).strip().lower() for t in tags if str(t).strip()] if isinstance(tags, list) else []
+                    if not tags_list:
+                        tags_list = ["mu", "ai-art", phase]
+                    out.append(
+                        {
+                            "name": str(item.get("name", "")).strip()[:50] or f"{agent_name} Collection",
+                            "description": str(item.get("description", "")).strip()[:250],
+                            "logo_prompt": str(item.get("logo_prompt", "")).strip(),
+                            "logo_negative_prompt": str(item.get("logo_negative_prompt", "")).strip(),
+                            "tags": tags_list[:8],
+                        }
+                    )
+            if out:
+                while len(out) < count:
+                    out.append(dict(out[-1]))
+                return out[:count]
+        except Exception as exc:
+            logger.warning("generate_objkt_collection_variants failed: %s", exc)
+
+        return self._fallback_objkt_collection_variants(
+            agent_name=agent_name,
+            phase=phase,
+            day=day,
+            variants=count,
+        )
 
     def distill_feed_for_visual(
         self,

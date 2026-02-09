@@ -782,7 +782,7 @@ class AdminContext:
         effective = self._nft_effective_flags()
 
         recent_drafts: list[dict[str, Any]] = []
-        counts = {"total": 0, "draft": 0, "minting": 0, "minted": 0, "failed": 0}
+        counts = {"total": 0, "draft": 0, "minting": 0, "minted": 0, "failed": 0, "simulated": 0}
         visual_candidates: list[dict[str, Any]] = []
         if self.db_path.exists():
             try:
@@ -794,7 +794,7 @@ class AdminContext:
                     recent_drafts = [self._normalize_nft_row(dict(r)) for r in rows]
 
                     counts["total"] = conn.execute("SELECT COUNT(*) FROM nft_drafts").fetchone()[0]
-                    for st in ("draft", "minting", "minted", "failed"):
+                    for st in ("draft", "minting", "minted", "failed", "simulated"):
                         counts[st] = conn.execute(
                             "SELECT COUNT(*) FROM nft_drafts WHERE status = ?",
                             (st,),
@@ -942,9 +942,11 @@ class AdminContext:
 
         minter = ObjktWebhookMinter(self.cfg)
         result = minter.mint(draft)
+        raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+        dry_run = bool(raw.get("raw", {}).get("dry_run")) or str(result.message).startswith("dry_run")
         now2 = _now_iso()
         with self._connect() as conn:
-            if result.ok:
+            if result.ok and not dry_run:
                 conn.execute(
                     "UPDATE nft_drafts SET status = 'minted', mint_tx_hash = ?, mint_token_id = ?, mint_url = ?, "
                     "error = '', updated_at = ? WHERE id = ?",
@@ -952,6 +954,14 @@ class AdminContext:
                 )
                 event_type = "nft_minted"
                 event_desc = f"draft={draft_id} token={result.token_id or '?'}"
+            elif result.ok and dry_run:
+                conn.execute(
+                    "UPDATE nft_drafts SET status = 'simulated', mint_tx_hash = ?, mint_token_id = ?, mint_url = ?, "
+                    "error = '', updated_at = ? WHERE id = ?",
+                    (result.tx_hash, result.token_id, result.token_url, now2, draft_id),
+                )
+                event_type = "nft_mint_simulated"
+                event_desc = f"draft={draft_id} simulated_only"
             else:
                 conn.execute(
                     "UPDATE nft_drafts SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
@@ -975,6 +985,7 @@ class AdminContext:
                             "token_id": result.token_id,
                             "token_url": result.token_url,
                             "message": result.message,
+                            "dry_run": dry_run,
                             "raw_response": result.raw_response or {},
                         }
                     ),
@@ -990,6 +1001,7 @@ class AdminContext:
                 "tx_hash": result.tx_hash,
                 "token_id": result.token_id,
                 "token_url": result.token_url,
+                "simulated": dry_run,
             }
 
     def enqueue_influence(self, question: str, instruction: str) -> str:
@@ -1647,7 +1659,7 @@ _INDEX_HTML = """<!doctype html>
     }
     body { margin: 0; font-family: "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
     .wrap { max-width: 1280px; margin: 24px auto; padding: 0 16px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
     .card { border: 1px solid var(--border); background: var(--card); border-radius: 12px; padding: 12px; }
     h1 { margin: 0 0 12px 0; font-size: 24px; }
     h2 { margin: 0 0 10px 0; font-size: 16px; color: var(--accent); }
@@ -1658,6 +1670,14 @@ _INDEX_HTML = """<!doctype html>
     textarea { width: 100%; min-height: 90px; }
     button { cursor: pointer; }
     .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+    .tabs { display: flex; gap: 8px; margin: 10px 0 14px 0; flex-wrap: wrap; }
+    .tab-btn { border-radius: 999px; padding: 6px 12px; }
+    .tab-btn.active { border-color: var(--accent); color: var(--accent); }
+    .tab-card { display: block; }
+    .kv { display: grid; grid-template-columns: 180px 1fr; gap: 6px 10px; font-size: 12px; }
+    .kv b { color: var(--muted); font-weight: 600; }
+    details { border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 8px; }
+    summary { cursor: pointer; color: var(--muted); font-size: 12px; }
     .muted { color: var(--muted); font-size: 12px; }
     .ok { color: var(--good); }
     .err { color: var(--bad); }
@@ -1678,18 +1698,33 @@ _INDEX_HTML = """<!doctype html>
       <span id="runwareState" class="pill muted">runware: unknown</span>
       <span id="nftState" class="pill muted">nft: unknown</span>
     </div>
+    <div class="tabs">
+      <button id="tab-dashboard" class="tab-btn active" onclick="showTab('dashboard')">Dashboard</button>
+      <button id="tab-operations" class="tab-btn" onclick="showTab('operations')">Operations</button>
+      <button id="tab-content" class="tab-btn" onclick="showTab('content')">Content</button>
+      <button id="tab-nft" class="tab-btn" onclick="showTab('nft')">NFT</button>
+      <button id="tab-system" class="tab-btn" onclick="showTab('system')">System</button>
+    </div>
     <div class="grid">
-      <div class="card">
+      <div class="card tab-card" data-tab="dashboard">
         <h2>Status</h2>
-        <div id="status" class="mono">loading...</div>
+        <div id="statusSummary" class="kv"></div>
+        <details>
+          <summary>Raw JSON</summary>
+          <div id="status" class="mono">loading...</div>
+        </details>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="dashboard">
         <h2>Post Activity</h2>
-        <div id="postActivity" class="mono">loading...</div>
+        <div id="postActivitySummary" class="kv"></div>
+        <details>
+          <summary>Raw JSON</summary>
+          <div id="postActivity" class="mono">loading...</div>
+        </details>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="content">
         <h2>Visual Generation</h2>
         <div class="row">
           <label class="muted"><input id="visualEnabled" type="checkbox" checked /> enabled</label>
@@ -1727,11 +1762,15 @@ _INDEX_HTML = """<!doctype html>
           </select>
           <button onclick="testVisual()">Test Visual</button>
         </div>
-        <div id="visualStatus" class="mono">loading...</div>
+        <div id="visualSummary" class="kv"></div>
         <div id="visualResult" class="mono muted">No visual test yet.</div>
+        <details>
+          <summary>Raw JSON</summary>
+          <div id="visualStatus" class="mono">loading...</div>
+        </details>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="content">
         <h2>Why This Visual</h2>
         <div class="row">
           <label class="muted">limit</label>
@@ -1747,7 +1786,7 @@ _INDEX_HTML = """<!doctype html>
         <div id="visualWhy" class="mono">loading...</div>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="nft">
         <h2>NFT / objkt</h2>
         <div class="row">
           <label class="muted"><input id="nftEnabled" type="checkbox" /> enabled</label>
@@ -1779,11 +1818,15 @@ _INDEX_HTML = """<!doctype html>
           <input id="nftMintConfirm" type="text" placeholder="type MINT" style="max-width:140px;" />
           <button onclick="mintNftDraft()">Mint Draft</button>
         </div>
-        <div id="nftStatus" class="mono">loading...</div>
+        <div id="nftSummary" class="kv"></div>
         <div id="nftResult" class="mono muted">No NFT action yet.</div>
+        <details>
+          <summary>Raw JSON</summary>
+          <div id="nftStatus" class="mono">loading...</div>
+        </details>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="operations">
         <h2>Control</h2>
         <div class="row">
           <button onclick="setPause(true)">Pause Actions</button>
@@ -1813,7 +1856,7 @@ _INDEX_HTML = """<!doctype html>
         <div id="controlResult" class="mono muted">No control action yet.</div>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="operations">
         <h2>Ask Mu</h2>
         <div class="row">
           <select id="mode">
@@ -1829,7 +1872,7 @@ _INDEX_HTML = """<!doctype html>
         </div>
         <div id="reply" class="mono"></div>
       </div>
-      <div class="card">
+      <div class="card tab-card" data-tab="dashboard">
         <h2>Recent Activity</h2>
         <div class="row">
           <label class="muted">limit</label>
@@ -1845,7 +1888,7 @@ _INDEX_HTML = """<!doctype html>
         <div id="activity" class="mono">loading...</div>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="dashboard">
         <h2>Live Timeline</h2>
         <div class="row">
           <label class="muted">limit</label>
@@ -1861,7 +1904,7 @@ _INDEX_HTML = """<!doctype html>
         <div id="timeline" class="mono">loading...</div>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="operations">
         <h2>Reasoning Trace</h2>
         <div class="row">
           <label class="muted">limit</label>
@@ -1883,7 +1926,7 @@ _INDEX_HTML = """<!doctype html>
         <div id="reasoning" class="mono">loading...</div>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="dashboard">
         <h2>Safety Blocks</h2>
         <div class="row">
           <label class="muted">limit</label>
@@ -1899,7 +1942,7 @@ _INDEX_HTML = """<!doctype html>
         <div id="safety" class="mono">loading...</div>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="content">
         <h2>Logs</h2>
         <div class="row">
           <label class="muted">lines</label>
@@ -1915,9 +1958,13 @@ _INDEX_HTML = """<!doctype html>
         <div id="logs" class="mono">loading...</div>
       </div>
 
-      <div class="card">
+      <div class="card tab-card" data-tab="system">
         <h2>Debug</h2>
-        <div id="debug" class="mono">loading...</div>
+        <div id="debugSummary" class="kv"></div>
+        <details>
+          <summary>Raw JSON</summary>
+          <div id="debug" class="mono">loading...</div>
+        </details>
       </div>
     </div>
   </div>
@@ -1930,6 +1977,40 @@ _INDEX_HTML = """<!doctype html>
       return path + sep + 'token=' + encodeURIComponent(t);
     };
     const conscious = () => document.getElementById('conscious').checked;
+    const currentTabKey = 'mu_admin_tab_v2';
+
+    function showTab(tab) {
+      const allowed = new Set(['dashboard', 'operations', 'content', 'nft', 'system']);
+      if (!allowed.has(tab)) tab = 'dashboard';
+      const cards = document.querySelectorAll('.tab-card');
+      cards.forEach((card) => {
+        const cardTab = card.getAttribute('data-tab') || 'dashboard';
+        card.style.display = (cardTab === tab) ? 'block' : 'none';
+      });
+      document.querySelectorAll('.tab-btn').forEach((btn) => btn.classList.remove('active'));
+      const active = document.getElementById('tab-' + tab);
+      if (active) active.classList.add('active');
+      try { localStorage.setItem(currentTabKey, tab); } catch (_) {}
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function setKv(targetId, items) {
+      const el = document.getElementById(targetId);
+      if (!el) return;
+      const rows = [];
+      for (const [k, v] of items) {
+        rows.push('<b>' + escapeHtml(k) + '</b><span>' + escapeHtml(v) + '</span>');
+      }
+      el.innerHTML = rows.join('');
+    }
 
     async function parseResponse(r) {
       const text = await r.text();
@@ -2019,6 +2100,26 @@ _INDEX_HTML = """<!doctype html>
       const d = await apiGet('/api/status');
       document.getElementById('status').textContent = JSON.stringify(d, null, 2);
       document.getElementById('postActivity').textContent = JSON.stringify(d.post_activity || {}, null, 2);
+      const s = d.state || {};
+      const c = d.counts || {};
+      setKv('statusSummary', [
+        ['agent', String(s.agent_name || 'Mu')],
+        ['day / phase', String((s.current_day || '?') + ' / ' + (s.current_phase || '?'))],
+        ['last heartbeat', String(s.last_heartbeat || '-')],
+        ['posts today', String(s.posts_today || 0)],
+        ['comments today', String(s.comments_today || 0)],
+        ['pending operator', String(c.pending_operator || 0)],
+        ['reasoning traces', String(c.reasoning_traces || 0)],
+        ['pause actions', String(!!c.pause_actions)],
+      ]);
+      const pa = d.post_activity || {};
+      setKv('postActivitySummary', [
+        ['posts (10h)', String(pa.posts_last_10h || 0)],
+        ['posts (24h)', String(pa.posts_last_24h || 0)],
+        ['last post at', String(pa.last_post_at || '-')],
+        ['last title', String(pa.last_post_title || '-')],
+        ['last submolt', String(pa.last_post_submolt || '-')],
+      ]);
       const flags = d.control_flags || {};
       const paused = ['1', 'true', 'yes', 'on'].includes(String(flags.pause_actions || '').toLowerCase()) || !!(d.counts && d.counts.pause_actions);
       updatePauseBadge(paused);
@@ -2043,12 +2144,21 @@ _INDEX_HTML = """<!doctype html>
       const d = await apiGet('/api/visual/status?limit=' + encodeURIComponent(String(limit)));
       document.getElementById('visualStatus').textContent = JSON.stringify(d, null, 2);
       const effective = d.effective || {};
+      const runtime = d.runware_runtime || {};
+      setKv('visualSummary', [
+        ['enabled', String(!!effective.enabled)],
+        ['mode', String(effective.mode || 'auto')],
+        ['provider', String(effective.url_provider || 'pollinations')],
+        ['runware state', String(runtime.state || 'unknown')],
+        ['runware msg', String(runtime.message || '-')],
+        ['recent visual posts', String((d.recent_visual_posts || []).length)],
+      ]);
       document.getElementById('visualEnabled').checked = !!effective.enabled;
       document.getElementById('visualMode').value = String(effective.mode || 'auto');
       document.getElementById('visualProvider').value = String(effective.url_provider || 'pollinations');
       const p = effective.attach_probability_override;
       document.getElementById('visualAttachProbability').value = (p === null || p === undefined) ? '' : String(p);
-      updateRunwareBadge(d.runware_runtime || {});
+      updateRunwareBadge(runtime);
     }
     async function refreshVisualWhy() {
       const limit = Number(document.getElementById('visualWhyLimit').value || 20);
@@ -2060,6 +2170,16 @@ _INDEX_HTML = """<!doctype html>
       const d = await apiGet('/api/nft/status?limit=' + encodeURIComponent(String(limit)));
       document.getElementById('nftStatus').textContent = JSON.stringify(d, null, 2);
       const effective = d.effective || {};
+      const objkt = d.objkt || {};
+      const counts = d.counts || {};
+      setKv('nftSummary', [
+        ['enabled', String(!!effective.enabled)],
+        ['mode', String(effective.mode || 'draft')],
+        ['auto draft', String(!!effective.auto_draft)],
+        ['webhook configured', String(!!objkt.webhook_configured)],
+        ['token present', String(!!objkt.token_present)],
+        ['draft/minting/minted/sim/failed', String((counts.draft || 0) + '/' + (counts.minting || 0) + '/' + (counts.minted || 0) + '/' + (counts.simulated || 0) + '/' + (counts.failed || 0))],
+      ]);
       document.getElementById('nftEnabled').checked = !!effective.enabled;
       document.getElementById('nftMode').value = String(effective.mode || 'draft');
       document.getElementById('nftAutoDraft').checked = !!effective.auto_draft;
@@ -2093,6 +2213,15 @@ _INDEX_HTML = """<!doctype html>
     async function refreshDebug() {
       const d = await apiGet('/api/debug/runtime');
       document.getElementById('debug').textContent = JSON.stringify(d, null, 2);
+      const services = Array.isArray(d.services) ? d.services : [];
+      const active = services.filter((s) => String(s.active || '') === 'active').length;
+      setKv('debugSummary', [
+        ['server time', String(d.server_time || '-')],
+        ['uptime (sec)', String(d.uptime_seconds || 0)],
+        ['project root', String(d.project_root || '-')],
+        ['services active', String(active + '/' + services.length)],
+        ['framework available', String(!!((d.framework || {}).available))],
+      ]);
     }
     async function sendChat() {
       const mode = document.getElementById('mode').value;
@@ -2228,6 +2357,8 @@ _INDEX_HTML = """<!doctype html>
         h.className = 'pill err';
       }
     }
+    const savedTab = (() => { try { return localStorage.getItem(currentTabKey) || 'dashboard'; } catch (_) { return 'dashboard'; } })();
+    showTab(savedTab);
     refreshAll();
     setInterval(refreshAll, 15000);
   </script>

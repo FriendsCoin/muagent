@@ -610,15 +610,17 @@ class MuAgent:
             error = ""
 
         if result and result.ok:
+            raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+            dry_run = bool(raw.get("raw", {}).get("dry_run")) or str(result.message).startswith("dry_run")
             await db.set_nft_draft_status(
                 draft_id,
-                status="minted",
+                status="simulated" if dry_run else "minted",
                 tx_hash=result.tx_hash,
                 token_id=result.token_id,
                 mint_url=result.token_url,
             )
             await db.log_narrative_event(
-                "nft_minted",
+                "nft_mint_simulated" if dry_run else "nft_minted",
                 f"draft={draft_id} token={result.token_id or 'unknown'}",
                 metadata={
                     "draft_id": draft_id,
@@ -626,6 +628,7 @@ class MuAgent:
                     "token_id": _truncate_text(result.token_id, 80),
                     "token_url": _truncate_text(result.token_url, 280),
                     "auto": True,
+                    "dry_run": dry_run,
                 },
             )
             return

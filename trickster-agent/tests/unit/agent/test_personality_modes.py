@@ -54,3 +54,18 @@ def test_distill_feed_for_visual_empty_inputs_returns_empty():
     # No _client needed — the method short-circuits before calling the API.
     assert p.distill_feed_for_visual([], []) == ""
     assert p.distill_feed_for_visual(["", "  "], [""]) == ""
+
+
+def test_generate_objkt_collection_variants_falls_back_without_client():
+    p = Personality.__new__(Personality)
+    rows = p.generate_objkt_collection_variants(
+        agent_name="Mu",
+        phase="emergence",
+        day=4,
+        variants=3,
+    )
+    assert len(rows) == 3
+    for item in rows:
+        assert len(item["name"]) <= 50
+        assert len(item["description"]) <= 250
+        assert isinstance(item["tags"], list)

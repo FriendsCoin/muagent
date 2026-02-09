@@ -85,6 +85,13 @@ class VisualGenerator:
             return self._generate_ascii(prompt=prompt, day=day)
         return VisualAttachment()
 
+    def generate_url_from_prompt(self, prompt: str, provider_override: str = "") -> VisualAttachment:
+        """Generate URL visual from an explicit prompt (bypasses auto prompt builder)."""
+        clean = str(prompt or "").strip()
+        if not clean:
+            return VisualAttachment()
+        return self._generate_url(clean, provider_override=provider_override)
+
     def _pick_mode(self) -> str:
         url_w = max(0.0, float(self._mode_weights.get("url", 0.65)))
         ascii_w = max(0.0, float(self._mode_weights.get("ascii", 0.35)))

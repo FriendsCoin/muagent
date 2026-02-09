@@ -27,6 +27,9 @@ python main.py --once
 
 # Run daemon (production)
 python main.py --daemon
+
+# Prepare objkt collection package + logo draft
+python scripts/prepare_objkt_collection.py --variants 3 --pick 1 --provider runware
 ```
 
 ## Documentation
