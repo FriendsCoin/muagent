@@ -502,6 +502,21 @@ class AdminContext:
         provider = str(flags.get("visual_url_provider", "")).strip().lower()
         if not provider:
             provider = str(self.cfg.get("visual_posting", {}).get("url", {}).get("provider", "pollinations"))
+        fallback_provider = str(flags.get("visual_fallback_provider", "")).strip().lower()
+        if not fallback_provider:
+            fallback_provider = str(
+                self.cfg.get("visual_posting", {}).get("url", {}).get("fallback_provider", "pollinations")
+            )
+        if fallback_provider not in {"pollinations", "ascii"}:
+            fallback_provider = "pollinations"
+
+        attempts_raw = str(flags.get("visual_runware_max_attempts", "")).strip()
+        attempts = None
+        if attempts_raw:
+            try:
+                attempts = max(1, min(5, int(attempts_raw)))
+            except ValueError:
+                attempts = None
 
         prob_raw = str(flags.get("visual_attach_probability", "")).strip()
         prob = None
@@ -515,6 +530,8 @@ class AdminContext:
             "enabled": enabled,
             "mode": mode,
             "url_provider": provider,
+            "fallback_provider": fallback_provider,
+            "runware_max_attempts_override": attempts,
             "attach_probability_override": prob,
         }
 
@@ -562,6 +579,8 @@ class AdminContext:
         runware_fallback_recent = 0
         runware_last_event_at = ""
         runware_last_provider = ""
+        runware_last_error_reason = ""
+        runware_last_error_detail = ""
         for item in recent_visual_events:
             if str(item.get("event_type", "")) != "visual_generated":
                 continue
@@ -585,6 +604,8 @@ class AdminContext:
             if not runware_last_event_at:
                 runware_last_event_at = str(item.get("created_at") or "")
                 runware_last_provider = provider
+                runware_last_error_reason = str(metadata.get("runware_error_reason", "")).strip().lower()
+                runware_last_error_detail = str(metadata.get("runware_error_detail", "")).strip()
 
         if not runware_key_present:
             runware_state = "no_key"
@@ -597,7 +618,10 @@ class AdminContext:
             runware_message = "Runware used successfully"
         elif runware_success_recent == 0 and runware_fallback_recent > 0:
             runware_state = "fallback"
-            runware_message = "Runware requests fell back to pollinations"
+            if runware_last_error_reason:
+                runware_message = f"Fallback after runware error: {runware_last_error_reason}"
+            else:
+                runware_message = "Runware requests fell back to alternate provider"
         else:
             runware_state = "mixed"
             runware_message = "Mixed runware success and fallback"
@@ -607,8 +631,10 @@ class AdminContext:
             "effective": effective,
             "providers": {
                 "url_configured_provider": str(visual_cfg.get("url", {}).get("provider", "pollinations")),
+                "fallback_provider": str(visual_cfg.get("url", {}).get("fallback_provider", "pollinations")),
                 "runware_key_present": runware_key_present,
                 "runware_endpoint": str(visual_cfg.get("url", {}).get("endpoint", "https://api.runware.ai/v1")),
+                "runware_max_attempts": int(visual_cfg.get("url", {}).get("runware_max_attempts", 1)),
             },
             "runware_runtime": {
                 "state": runware_state,
@@ -618,6 +644,8 @@ class AdminContext:
                 "fallback_recent": runware_fallback_recent,
                 "last_event_at": runware_last_event_at,
                 "last_provider": runware_last_provider,
+                "last_error_reason": runware_last_error_reason,
+                "last_error_detail": runware_last_error_detail,
             },
             "mode_weights": visual_cfg.get("mode_weights", {"url": 0.65, "ascii": 0.35}),
             "attach_probability": visual_cfg.get(
@@ -696,6 +724,10 @@ class AdminContext:
                         "feed_visual_keywords": str(metadata.get("feed_visual_keywords", "")),
                         "visual_context": str(metadata.get("visual_context", "")),
                         "operator_instruction": str(metadata.get("operator_instruction", "")),
+                        "runware_error_reason": str(metadata.get("runware_error_reason", "")),
+                        "runware_error_detail": str(metadata.get("runware_error_detail", "")),
+                        "runware_fallback_used": _to_bool(metadata.get("runware_fallback_used", False), default=False),
+                        "fallback_provider_used": str(metadata.get("fallback_provider_used", "")),
                         "feed_trending_topics": feed_topics,
                         "feed_top_titles": feed_titles,
                     },
@@ -724,6 +756,8 @@ class AdminContext:
             enabled_override=effective["enabled"],
             attach_probability_override=1.0 if mode != "auto" else effective["attach_probability_override"],
             url_provider_override=str(effective["url_provider"] or ""),
+            fallback_provider_override=str(effective.get("fallback_provider") or ""),
+            runware_max_attempts_override=effective.get("runware_max_attempts_override"),
         )
         payload = {
             "kind": visual.kind,
@@ -731,6 +765,7 @@ class AdminContext:
             "prompt": visual.prompt,
             "url": visual.url,
             "ascii_art": visual.ascii_art,
+            "meta": visual.meta,
             "phase": phase,
             "day": day,
             "mode": mode,
@@ -1499,6 +1534,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             enabled = _to_bool(body.get("enabled", True), default=True)
             mode = str(body.get("mode", "auto")).strip().lower()
             provider = str(body.get("url_provider", "")).strip().lower()
+            fallback_provider = str(body.get("fallback_provider", "")).strip().lower()
+            runware_attempts_raw = str(body.get("runware_max_attempts", "")).strip()
             attach_probability_raw = str(body.get("attach_probability", "")).strip()
             if mode not in {"auto", "url", "ascii", "off"}:
                 self._send_json(400, {"error": "invalid_mode"})
@@ -1506,11 +1543,26 @@ class AdminHandler(BaseHTTPRequestHandler):
             if provider and provider not in {"pollinations", "runware"}:
                 self._send_json(400, {"error": "invalid_provider"})
                 return
+            if fallback_provider and fallback_provider not in {"pollinations", "ascii"}:
+                self._send_json(400, {"error": "invalid_fallback_provider"})
+                return
 
             self.ctx.set_control_flag("visual_enabled", "1" if enabled else "0")
             self.ctx.set_control_flag("visual_mode", mode)
             if provider:
                 self.ctx.set_control_flag("visual_url_provider", provider)
+            if fallback_provider:
+                self.ctx.set_control_flag("visual_fallback_provider", fallback_provider)
+
+            if runware_attempts_raw:
+                try:
+                    attempts = max(1, min(5, int(runware_attempts_raw)))
+                except ValueError:
+                    self._send_json(400, {"error": "invalid_runware_max_attempts"})
+                    return
+                self.ctx.set_control_flag("visual_runware_max_attempts", str(attempts))
+            else:
+                self.ctx.set_control_flag("visual_runware_max_attempts", "")
 
             if attach_probability_raw:
                 try:
@@ -1740,6 +1792,13 @@ _INDEX_HTML = """<!doctype html>
             <option value="pollinations" selected>pollinations</option>
             <option value="runware">runware</option>
           </select>
+          <label class="muted">fallback</label>
+          <select id="visualFallbackProvider">
+            <option value="pollinations" selected>pollinations</option>
+            <option value="ascii">ascii</option>
+          </select>
+          <label class="muted">runware tries</label>
+          <input id="visualRunwareAttempts" type="number" min="1" max="5" step="1" placeholder="cfg" style="width:72px;" />
           <label class="muted">attach p</label>
           <input id="visualAttachProbability" type="number" min="0" max="1" step="0.05" placeholder="auto" style="width:90px;" />
           <button onclick="saveVisualConfig()">Apply Visual</button>
@@ -2149,6 +2208,12 @@ _INDEX_HTML = """<!doctype html>
         ['enabled', String(!!effective.enabled)],
         ['mode', String(effective.mode || 'auto')],
         ['provider', String(effective.url_provider || 'pollinations')],
+        ['fallback', String(effective.fallback_provider || ((d.providers || {}).fallback_provider || 'pollinations'))],
+        ['runware tries', String(
+          (effective.runware_max_attempts_override !== null && effective.runware_max_attempts_override !== undefined)
+            ? effective.runware_max_attempts_override
+            : ((d.providers || {}).runware_max_attempts || 1)
+        )],
         ['runware state', String(runtime.state || 'unknown')],
         ['runware msg', String(runtime.message || '-')],
         ['recent visual posts', String((d.recent_visual_posts || []).length)],
@@ -2156,6 +2221,12 @@ _INDEX_HTML = """<!doctype html>
       document.getElementById('visualEnabled').checked = !!effective.enabled;
       document.getElementById('visualMode').value = String(effective.mode || 'auto');
       document.getElementById('visualProvider').value = String(effective.url_provider || 'pollinations');
+      document.getElementById('visualFallbackProvider').value = String(
+        effective.fallback_provider || ((d.providers || {}).fallback_provider || 'pollinations')
+      );
+      const runwareAttempts = effective.runware_max_attempts_override;
+      document.getElementById('visualRunwareAttempts').value =
+        (runwareAttempts === null || runwareAttempts === undefined) ? '' : String(runwareAttempts);
       const p = effective.attach_probability_override;
       document.getElementById('visualAttachProbability').value = (p === null || p === undefined) ? '' : String(p);
       updateRunwareBadge(runtime);
@@ -2259,11 +2330,15 @@ _INDEX_HTML = """<!doctype html>
       const enabled = document.getElementById('visualEnabled').checked;
       const mode = document.getElementById('visualMode').value;
       const urlProvider = document.getElementById('visualProvider').value;
+      const fallbackProvider = document.getElementById('visualFallbackProvider').value;
+      const runwareAttempts = document.getElementById('visualRunwareAttempts').value.trim();
       const attachProbability = document.getElementById('visualAttachProbability').value.trim();
       const payload = {
         enabled,
         mode,
         url_provider: urlProvider,
+        fallback_provider: fallbackProvider,
+        runware_max_attempts: runwareAttempts,
         attach_probability: attachProbability,
       };
       const d = await apiPost('/api/control/visual', payload);

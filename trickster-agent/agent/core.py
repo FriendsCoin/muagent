@@ -287,14 +287,23 @@ class MuAgent:
         visual_enabled_override = _flag_to_bool(await db.get_control_flag("visual_enabled", ""))
         visual_mode_flag = (await db.get_control_flag("visual_mode", "auto")).strip().lower()
         visual_provider_flag = (await db.get_control_flag("visual_url_provider", "")).strip().lower()
+        visual_fallback_provider_flag = (await db.get_control_flag("visual_fallback_provider", "")).strip().lower()
+        visual_runware_attempts_raw = (await db.get_control_flag("visual_runware_max_attempts", "")).strip()
         visual_attach_prob_raw = (await db.get_control_flag("visual_attach_probability", "")).strip()
         visual_attach_prob_override: float | None = None
+        visual_runware_attempts_override: int | None = None
         if visual_attach_prob_raw:
             try:
                 parsed = float(visual_attach_prob_raw)
                 visual_attach_prob_override = max(0.0, min(1.0, parsed))
             except ValueError:
                 visual_attach_prob_override = None
+        if visual_runware_attempts_raw:
+            try:
+                parsed_attempts = int(visual_runware_attempts_raw)
+                visual_runware_attempts_override = max(1, min(5, parsed_attempts))
+            except ValueError:
+                visual_runware_attempts_override = None
 
         instruction_low = (action.operator_instruction or "").lower()
         force_visual_mode = ""
@@ -338,15 +347,19 @@ class MuAgent:
             enabled_override=visual_enabled_override,
             attach_probability_override=visual_attach_prob_override,
             url_provider_override=visual_provider_flag,
+            fallback_provider_override=visual_fallback_provider_flag,
+            runware_max_attempts_override=visual_runware_attempts_override,
         )
         if visual.kind != "none":
             requested_url_provider = (
                 visual_provider_flag
                 or str(self._cfg.get("visual_posting", {}).get("url", {}).get("provider", "pollinations"))
             ).strip().lower()
+            runware_error_reason = str((visual.meta or {}).get("runware_error_reason", "")).strip().lower()
+            runware_error_detail = _truncate_text(str((visual.meta or {}).get("runware_error_detail", "")), 220)
+            fallback_provider_used = str((visual.meta or {}).get("fallback_provider_used", "")).strip().lower()
             runware_fallback_used = (
                 requested_url_provider == "runware"
-                and visual.kind == "url"
                 and visual.provider != "runware"
             )
             feed_titles: list[str] = []
@@ -394,8 +407,13 @@ class MuAgent:
                     "enabled_override": visual_enabled_override,
                     "attach_probability_override": visual_attach_prob_override,
                     "provider_override": visual_provider_flag,
+                    "fallback_provider_override": visual_fallback_provider_flag,
+                    "runware_max_attempts_override": visual_runware_attempts_override,
                     "requested_url_provider": requested_url_provider,
                     "runware_fallback_used": runware_fallback_used,
+                    "runware_error_reason": runware_error_reason,
+                    "runware_error_detail": runware_error_detail,
+                    "fallback_provider_used": fallback_provider_used,
                 },
             )
         post_content = content
