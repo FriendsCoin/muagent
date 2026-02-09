@@ -291,6 +291,9 @@ class MuAgent:
         feed_context: FeedContext | None = None,
     ) -> str:
         """Create a new post."""
+        writes_raw = (await db.get_control_flag("moltbook_write_enabled", "1")).strip().lower()
+        writes_enabled = writes_raw not in {"0", "false", "no", "off"}
+
         # Check if this post should include the narrative sigil.
         next_total = state.total_posts + 1
         sigil = ""
@@ -538,26 +541,30 @@ class MuAgent:
 
         submolt = random.choice(self._cfg.get("moltbook", {}).get("preferred_submolts", ["general"]))
 
-        if self._dry_run:
+        if self._dry_run or not writes_enabled:
+            moltbook_id = "dry_run" if self._dry_run else "simulated"
+            prefix = "DRY RUN" if self._dry_run else "SIMULATED"
             if post_url:
                 logger.info(
-                    "[DRY RUN] Would post link to s/%s: %s - %s | url=%s",
+                    "[%s] Would post link to s/%s: %s - %s | url=%s",
+                    prefix,
                     submolt,
                     title,
                     post_content,
                     post_url,
                 )
             else:
-                logger.info("[DRY RUN] Would post to s/%s: %s - %s", submolt, title, post_content)
+                logger.info("[%s] Would post to s/%s: %s - %s", prefix, submolt, title, post_content)
             await db.log_post(
-                "dry_run",
+                moltbook_id,
                 state.current_day,
                 title,
                 post_content,
                 image_path=image_path,
                 submolt=submolt,
             )
-            return f"dry_run_post: {title} | visual={visual.kind}"
+            kind = "dry_run_post" if self._dry_run else "simulated_post"
+            return f"{kind}: {title} | visual={visual.kind}"
 
         try:
             delay = random.uniform(
@@ -613,6 +620,7 @@ class MuAgent:
             if _is_moltbook_suspension_error(exc):
                 logger.error("Moltbook account appears suspended/locked: %s", exc)
                 await db.set_control_flag("pause_actions", "1")
+                await db.set_control_flag("moltbook_write_enabled", "0")
                 await db.log_narrative_event(
                     "moltbook_suspended",
                     "Moltbook rejected posting due to suspension/verification lock; auto-paused actions",
@@ -797,6 +805,9 @@ class MuAgent:
         db: HistoryDB,
     ) -> str:
         """Comment on a post."""
+        writes_raw = (await db.get_control_flag("moltbook_write_enabled", "1")).strip().lower()
+        writes_enabled = writes_raw not in {"0", "false", "no", "off"}
+
         if not action.target_post:
             logger.warning("Comment action has no target post")
             return "no_target"
@@ -813,10 +824,13 @@ class MuAgent:
             context=action.operator_instruction,
         )
 
-        if self._dry_run:
-            logger.info("[DRY RUN] Would comment on %s: %s", post.id, comment_text)
-            await db.log_comment("dry_run", post.id, comment_text, tone=action.tone)
-            return f"dry_run_comment: {post.id}"
+        if self._dry_run or not writes_enabled:
+            moltbook_id = "dry_run" if self._dry_run else "simulated"
+            prefix = "DRY RUN" if self._dry_run else "SIMULATED"
+            logger.info("[%s] Would comment on %s: %s", prefix, post.id, comment_text)
+            await db.log_comment(moltbook_id, post.id, comment_text, tone=action.tone)
+            kind = "dry_run_comment" if self._dry_run else "simulated_comment"
+            return f"{kind}: {post.id}"
 
         try:
             await asyncio.sleep(random.uniform(5, 20))
@@ -831,6 +845,7 @@ class MuAgent:
             if _is_moltbook_suspension_error(exc):
                 logger.error("Moltbook account appears suspended/locked: %s", exc)
                 await db.set_control_flag("pause_actions", "1")
+                await db.set_control_flag("moltbook_write_enabled", "0")
                 await db.log_narrative_event(
                     "moltbook_suspended",
                     "Moltbook rejected commenting due to suspension/verification lock; auto-paused actions",
@@ -850,12 +865,16 @@ class MuAgent:
 
     async def _do_upvote(self, action: Action, mb: MoltbookClient, db: HistoryDB) -> str:
         """Upvote a post."""
+        writes_raw = (await db.get_control_flag("moltbook_write_enabled", "1")).strip().lower()
+        writes_enabled = writes_raw not in {"0", "false", "no", "off"}
+
         if not action.target_post:
             return "no_target"
 
-        if self._dry_run:
-            logger.info("[DRY RUN] Would upvote %s", action.target_post.id)
-            return "dry_run_upvote"
+        if self._dry_run or not writes_enabled:
+            prefix = "DRY RUN" if self._dry_run else "SIMULATED"
+            logger.info("[%s] Would upvote %s", prefix, action.target_post.id)
+            return "dry_run_upvote" if self._dry_run else "simulated_upvote"
 
         try:
             await mb.upvote_post(action.target_post.id)
@@ -865,6 +884,24 @@ class MuAgent:
                 target_content_id=action.target_post.id,
             )
             return f"upvoted: {action.target_post.id}"
+        except MoltbookError as exc:
+            if _is_moltbook_suspension_error(exc):
+                logger.error("Moltbook account appears suspended/locked: %s", exc)
+                await db.set_control_flag("pause_actions", "1")
+                await db.set_control_flag("moltbook_write_enabled", "0")
+                await db.log_narrative_event(
+                    "moltbook_suspended",
+                    "Moltbook rejected upvote due to suspension/verification lock; auto-paused actions",
+                    metadata={
+                        "error": _truncate_text(str(exc), 600),
+                        "status_code": getattr(exc, "status_code", 0),
+                        "hint": _truncate_text(getattr(exc, "hint", ""), 280),
+                        "action": "upvote",
+                    },
+                )
+                return "moltbook_suspended"
+            logger.warning("Moltbook error on upvote: %s", exc)
+            return f"moltbook_error: {_truncate_text(str(exc), 220)}"
         except Exception as exc:
             logger.warning("Failed to upvote: %s", exc)
             return f"error: {exc}"

@@ -1590,6 +1590,12 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"ok": True, "paused": paused, "control_flags": flags})
             return
 
+        if path == "/api/control/moltbook":
+            writes_enabled = _to_bool(body.get("writes_enabled", True), default=True)
+            self.ctx.set_control_flag("moltbook_write_enabled", "1" if writes_enabled else "0")
+            self._send_json(200, {"ok": True, "control_flags": self.ctx.get_control_flags()})
+            return
+
         if path == "/api/control/reload_framework":
             self.ctx.reload_framework()
             self._send_json(
@@ -1993,6 +1999,11 @@ _INDEX_HTML = """<!doctype html>
           <button onclick="thinkNow()">Think Now</button>
         </div>
         <div class="row">
+          <label class="muted"><input id="moltbookWritesEnabled" type="checkbox" checked /> Moltbook writes</label>
+          <button onclick="saveMoltbookConfig()">Apply Moltbook</button>
+          <span class="muted">When off: simulate actions locally (no Moltbook API writes).</span>
+        </div>
+        <div class="row">
           <button onclick="runOnce(true)">Run Once (Dry)</button>
           <button onclick="runOnce(false)">Run Once (Live)</button>
           <button onclick="reloadFramework()">Reload Framework</button>
@@ -2282,6 +2293,9 @@ _INDEX_HTML = """<!doctype html>
       const flags = d.control_flags || {};
       const paused = ['1', 'true', 'yes', 'on'].includes(String(flags.pause_actions || '').toLowerCase()) || !!(d.counts && d.counts.pause_actions);
       updatePauseBadge(paused);
+      const writesEnabled = !['0', 'false', 'no', 'off'].includes(String(flags.moltbook_write_enabled || '1').toLowerCase());
+      const mw = document.getElementById('moltbookWritesEnabled');
+      if (mw) mw.checked = writesEnabled;
       const thinkerEnabled = ['1', 'true', 'yes', 'on'].includes(String(flags.thinker_enabled || '').toLowerCase());
       const thinkerAutoQueue = !['0', 'false', 'no', 'off'].includes(String(flags.thinker_auto_queue || '1').toLowerCase());
       document.getElementById('thinkerEnabled').checked = thinkerEnabled;
@@ -2412,6 +2426,12 @@ _INDEX_HTML = """<!doctype html>
       const d = await apiPost('/api/control/pause', {paused});
       document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
       updatePauseBadge(!!paused);
+      await refreshAll();
+    }
+    async function saveMoltbookConfig() {
+      const writesEnabled = document.getElementById('moltbookWritesEnabled').checked;
+      const d = await apiPost('/api/control/moltbook', {writes_enabled: writesEnabled});
+      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
       await refreshAll();
     }
     async function reloadFramework() {
