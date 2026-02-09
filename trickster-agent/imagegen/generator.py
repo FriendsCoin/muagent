@@ -12,7 +12,7 @@ import random
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import httpx
 
@@ -134,7 +134,7 @@ class VisualGenerator:
 
     def tts_from_text(self, text: str, voice_override: str = "") -> VisualAttachment:
         """Create a TTS audio URL (Pollinations) from plain text."""
-        clean = str(text or "").strip()
+        clean = " ".join(str(text or "").split())
         if not clean:
             return VisualAttachment()
         voice = str(voice_override or self._media_cfg.get("audio_voice", "alloy")).strip() or "alloy"
@@ -146,9 +146,12 @@ class VisualGenerator:
 
     def _generate_audio(self, *, prompt: str, voice_override: str = "") -> VisualAttachment:
         voice = str(voice_override or self._media_cfg.get("audio_voice", "alloy")).strip() or "alloy"
-        seed_base = hashlib.sha1(f"audio:{prompt}".encode("utf-8")).hexdigest()
+        prompt_clean = " ".join(str(prompt or "").split())
+        seed_base = hashlib.sha1(f"audio:{prompt_clean}".encode("utf-8")).hexdigest()
         seed = int(seed_base[:8], 16)
-        encoded = quote_plus(prompt)
+        # IMPORTANT: prompt is embedded in the URL path segment.
+        # In paths, '+' is not decoded to space, so use percent-encoding (%20).
+        encoded = quote(prompt_clean, safe="")
         public_url = (
             f"{self._pollinations_media_endpoint}/audio/{encoded}"
             f"?voice={quote_plus(voice)}&seed={seed}"
@@ -158,7 +161,7 @@ class VisualGenerator:
         return VisualAttachment(
             kind="url",
             provider="pollinations_audio",
-            prompt=prompt,
+            prompt=prompt_clean,
             url=url,
             meta={
                 "media_type": "audio",
@@ -171,9 +174,10 @@ class VisualGenerator:
 
     def _generate_video(self, *, prompt: str) -> VisualAttachment:
         model = str(self._media_cfg.get("video_model", "fast")).strip() or "fast"
-        seed_base = hashlib.sha1(f"video:{prompt}".encode("utf-8")).hexdigest()
+        prompt_clean = " ".join(str(prompt or "").split())
+        seed_base = hashlib.sha1(f"video:{prompt_clean}".encode("utf-8")).hexdigest()
         seed = int(seed_base[:8], 16)
-        encoded = quote_plus(prompt)
+        encoded = quote(prompt_clean, safe="")
         public_url = (
             f"{self._pollinations_media_endpoint}/video/{encoded}"
             f"?model={quote_plus(model)}&seed={seed}"
@@ -183,7 +187,7 @@ class VisualGenerator:
         return VisualAttachment(
             kind="url",
             provider="pollinations_video",
-            prompt=prompt,
+            prompt=prompt_clean,
             url=url,
             meta={
                 "media_type": "video",
