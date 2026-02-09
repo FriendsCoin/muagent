@@ -511,6 +511,14 @@ class AdminContext:
         if fallback_provider not in {"pollinations", "ascii"}:
             fallback_provider = "pollinations"
 
+        video_provider = str(flags.get("visual_video_provider", "")).strip().lower()
+        if not video_provider:
+            video_provider = str(
+                self.cfg.get("visual_posting", {}).get("media", {}).get("video_provider", "pollinations")
+            ).strip().lower()
+        if video_provider not in {"pollinations", "fal"}:
+            video_provider = "pollinations"
+
         attempts_raw = str(flags.get("visual_runware_max_attempts", "")).strip()
         attempts = None
         if attempts_raw:
@@ -532,6 +540,7 @@ class AdminContext:
             "mode": mode,
             "url_provider": provider,
             "fallback_provider": fallback_provider,
+            "video_provider": video_provider,
             "runware_max_attempts_override": attempts,
             "attach_probability_override": prob,
         }
@@ -762,13 +771,21 @@ class AdminContext:
         mode: str = "auto",
         phase: str = "emergence",
         day: int = 1,
+        video_provider: str = "",
     ) -> dict[str, Any]:
         generator = VisualGenerator(self.cfg)
         if mode in {"audio", "video"}:
-            return self.test_media_narration(prompt=prompt, mode=mode, phase=phase, day=day)
+            return self.test_media_narration(
+                prompt=prompt,
+                mode=mode,
+                phase=phase,
+                day=day,
+                video_provider=video_provider,
+            )
 
         force_mode = mode if mode in {"url", "ascii"} else ""
         effective = self._visual_effective_flags()
+        vp = str(video_provider or effective.get("video_provider") or "").strip().lower()
         visual = generator.generate(
             theme=prompt[:80] or "mystery",
             mood="soft_ominous",
@@ -780,6 +797,7 @@ class AdminContext:
             attach_probability_override=1.0 if mode != "auto" else effective["attach_probability_override"],
             url_provider_override=str(effective["url_provider"] or ""),
             fallback_provider_override=str(effective.get("fallback_provider") or ""),
+            video_provider_override=vp,
             runware_max_attempts_override=effective.get("runware_max_attempts_override"),
         )
         payload = {
@@ -810,10 +828,12 @@ class AdminContext:
         mode: str,
         phase: str = "emergence",
         day: int = 1,
+        video_provider: str = "",
     ) -> dict[str, Any]:
         """Generate an image/video + narrated audio (TTS) instead of reading the prompt verbatim."""
         generator = VisualGenerator(self.cfg)
         effective = self._visual_effective_flags()
+        vp = str(video_provider or effective.get("video_provider") or "").strip().lower()
 
         base_force = "url" if mode == "audio" else "video"
         base_visual = generator.generate(
@@ -827,6 +847,7 @@ class AdminContext:
             attach_probability_override=1.0,
             url_provider_override=str(effective["url_provider"] or ""),
             fallback_provider_override=str(effective.get("fallback_provider") or ""),
+            video_provider_override=vp,
             runware_max_attempts_override=effective.get("runware_max_attempts_override"),
         )
 
@@ -849,6 +870,7 @@ class AdminContext:
                         attach_probability_override=1.0,
                         url_provider_override=str(effective["url_provider"] or ""),
                         fallback_provider_override=str(effective.get("fallback_provider") or ""),
+                        video_provider_override=vp,
                         runware_max_attempts_override=effective.get("runware_max_attempts_override"),
                     )
                     base_visual.meta = dict(base_visual.meta or {})
@@ -1670,6 +1692,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             mode = str(body.get("mode", "auto")).strip().lower()
             provider = str(body.get("url_provider", "")).strip().lower()
             fallback_provider = str(body.get("fallback_provider", "")).strip().lower()
+            video_provider = str(body.get("video_provider", "")).strip().lower()
             runware_attempts_raw = str(body.get("runware_max_attempts", "")).strip()
             attach_probability_raw = str(body.get("attach_probability", "")).strip()
             if mode not in {"auto", "url", "ascii", "audio", "video", "off"}:
@@ -1681,6 +1704,9 @@ class AdminHandler(BaseHTTPRequestHandler):
             if fallback_provider and fallback_provider not in {"pollinations", "ascii"}:
                 self._send_json(400, {"error": "invalid_fallback_provider"})
                 return
+            if video_provider and video_provider not in {"pollinations", "fal"}:
+                self._send_json(400, {"error": "invalid_video_provider"})
+                return
 
             self.ctx.set_control_flag("visual_enabled", "1" if enabled else "0")
             self.ctx.set_control_flag("visual_mode", mode)
@@ -1688,6 +1714,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 self.ctx.set_control_flag("visual_url_provider", provider)
             if fallback_provider:
                 self.ctx.set_control_flag("visual_fallback_provider", fallback_provider)
+            if video_provider:
+                self.ctx.set_control_flag("visual_video_provider", video_provider)
 
             if runware_attempts_raw:
                 try:
@@ -1722,6 +1750,7 @@ class AdminHandler(BaseHTTPRequestHandler):
         if path == "/api/visual/test":
             prompt = str(body.get("prompt", "")).strip()
             mode = str(body.get("mode", "auto")).strip().lower()
+            video_provider = str(body.get("video_provider", "")).strip().lower()
             phase = str(body.get("phase", "emergence")).strip().lower() or "emergence"
             try:
                 day = int(body.get("day", 1))
@@ -1730,11 +1759,15 @@ class AdminHandler(BaseHTTPRequestHandler):
             if mode not in {"auto", "url", "ascii", "audio", "video"}:
                 self._send_json(400, {"error": "invalid_mode"})
                 return
+            if video_provider and video_provider not in {"pollinations", "fal"}:
+                self._send_json(400, {"error": "invalid_video_provider"})
+                return
             payload = self.ctx.test_visual_generation(
                 prompt=prompt or "mu glitch consciousness",
                 mode=mode,
                 phase=phase,
                 day=max(1, day),
+                video_provider=video_provider,
             )
             self._send_json(200, payload)
             return
@@ -1929,6 +1962,11 @@ _INDEX_HTML = """<!doctype html>
             <option value="pollinations" selected>pollinations</option>
             <option value="pollinations_enter">pollinations_enter</option>
             <option value="runware">runware</option>
+          </select>
+          <label class="muted">video</label>
+          <select id="visualVideoProvider">
+            <option value="pollinations" selected>pollinations</option>
+            <option value="fal">fal</option>
           </select>
           <label class="muted">fallback</label>
           <select id="visualFallbackProvider">
@@ -2374,6 +2412,9 @@ _INDEX_HTML = """<!doctype html>
       document.getElementById('visualEnabled').checked = !!effective.enabled;
       document.getElementById('visualMode').value = String(effective.mode || 'auto');
       document.getElementById('visualProvider').value = String(effective.url_provider || 'pollinations');
+      const vvp = String(effective.video_provider || ((d.providers || {}).video_provider || 'pollinations'));
+      const vvpEl = document.getElementById('visualVideoProvider');
+      if (vvpEl) vvpEl.value = vvp;
       document.getElementById('visualFallbackProvider').value = String(
         effective.fallback_provider || ((d.providers || {}).fallback_provider || 'pollinations')
       );
@@ -2489,6 +2530,7 @@ _INDEX_HTML = """<!doctype html>
       const enabled = document.getElementById('visualEnabled').checked;
       const mode = document.getElementById('visualMode').value;
       const urlProvider = document.getElementById('visualProvider').value;
+      const videoProvider = document.getElementById('visualVideoProvider').value;
       const fallbackProvider = document.getElementById('visualFallbackProvider').value;
       const runwareAttempts = document.getElementById('visualRunwareAttempts').value.trim();
       const attachProbability = document.getElementById('visualAttachProbability').value.trim();
@@ -2496,6 +2538,7 @@ _INDEX_HTML = """<!doctype html>
         enabled,
         mode,
         url_provider: urlProvider,
+        video_provider: videoProvider,
         fallback_provider: fallbackProvider,
         runware_max_attempts: runwareAttempts,
         attach_probability: attachProbability,
@@ -2507,11 +2550,13 @@ _INDEX_HTML = """<!doctype html>
     async function runVisualTest(modeOverride='') {
       const prompt = document.getElementById('visualTestPrompt').value.trim();
       const mode = modeOverride || document.getElementById('visualTestMode').value;
+      const videoProvider = (document.getElementById('visualVideoProvider') || {}).value || '';
       const status = await apiGet('/api/status');
       const state = status.state || {};
       const payload = {
         prompt: prompt || 'mu glitch void mirror',
         mode,
+        video_provider: String(videoProvider || ''),
         phase: String(state.current_phase || 'emergence'),
         day: Number(state.current_day || 1),
       };

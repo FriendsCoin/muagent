@@ -312,6 +312,7 @@ class MuAgent:
         visual_mode_flag = (await db.get_control_flag("visual_mode", "auto")).strip().lower()
         visual_provider_flag = (await db.get_control_flag("visual_url_provider", "")).strip().lower()
         visual_fallback_provider_flag = (await db.get_control_flag("visual_fallback_provider", "")).strip().lower()
+        visual_video_provider_flag = (await db.get_control_flag("visual_video_provider", "")).strip().lower()
         visual_runware_attempts_raw = (await db.get_control_flag("visual_runware_max_attempts", "")).strip()
         visual_attach_prob_raw = (await db.get_control_flag("visual_attach_probability", "")).strip()
         visual_attach_prob_override: float | None = None
@@ -376,6 +377,7 @@ class MuAgent:
             attach_probability_override=visual_attach_prob_override,
             url_provider_override=visual_provider_flag,
             fallback_provider_override=visual_fallback_provider_flag,
+            video_provider_override=visual_video_provider_flag,
             runware_max_attempts_override=visual_runware_attempts_override,
         )
 
@@ -397,6 +399,7 @@ class MuAgent:
                 attach_probability_override=1.0,
                 url_provider_override=visual_provider_flag,
                 fallback_provider_override=visual_fallback_provider_flag,
+                video_provider_override=visual_video_provider_flag,
                 runware_max_attempts_override=visual_runware_attempts_override,
             )
 
@@ -418,6 +421,7 @@ class MuAgent:
                             attach_probability_override=1.0,
                             url_provider_override=visual_provider_flag,
                             fallback_provider_override=visual_fallback_provider_flag,
+                            video_provider_override=visual_video_provider_flag,
                             runware_max_attempts_override=visual_runware_attempts_override,
                         )
                         base_visual.meta = dict(base_visual.meta or {})

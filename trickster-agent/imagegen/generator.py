@@ -67,6 +67,7 @@ class VisualGenerator:
         attach_probability_override: float | None = None,
         url_provider_override: str = "",
         fallback_provider_override: str = "",
+        video_provider_override: str = "",
         runware_max_attempts_override: int | None = None,
     ) -> VisualAttachment:
         """Return a visual attachment candidate for a post."""
@@ -104,7 +105,7 @@ class VisualGenerator:
         if mode == "audio":
             return self._generate_audio(prompt=prompt)
         if mode == "video":
-            return self._generate_video(prompt=prompt)
+            return self._generate_video(prompt=prompt, video_provider_override=video_provider_override)
         if mode == "ascii":
             return self._generate_ascii(prompt=prompt, day=day)
         return VisualAttachment()
@@ -175,8 +176,8 @@ class VisualGenerator:
             },
         )
 
-    def _generate_video(self, *, prompt: str) -> VisualAttachment:
-        provider = self._video_provider
+    def _generate_video(self, *, prompt: str, video_provider_override: str = "") -> VisualAttachment:
+        provider = str(video_provider_override or self._video_provider).strip().lower() or self._video_provider
         if provider == "fal":
             visual, reason, detail = self._generate_fal_video_url(prompt=prompt)
             if visual is not None:
