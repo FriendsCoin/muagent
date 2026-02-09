@@ -10,10 +10,13 @@ param(
     [string] $RepoUser = "bot"
 )
 
-$remoteCmd = @"
+# NOTE: This must be a single-quoted here-string so PowerShell does NOT expand
+# bash constructs like $(date ...) or $(dirname ...).
+$remoteCmd = @'
 set -euo pipefail
-echo '[1/4] git fetch/pull as $RepoUser'
-sudo -u $RepoUser -H bash -lc '
+REPO_USER="__REPO_USER__"
+echo "[1/4] git fetch/pull as ${REPO_USER}"
+sudo -u "${REPO_USER}" -H bash -lc '
 set -euo pipefail
 cd /opt/trickster-agent/repo
 git config --global --add safe.directory /opt/trickster-agent/repo
@@ -51,7 +54,7 @@ if [ -f \"\$backup/data/state.json\" ]; then cp -a \"\$backup/data/state.json\" 
 '
 echo '[2/4] ensure runtime dirs'
 mkdir -p /opt/trickster-agent/repo/trickster-agent/data
-chown -R ${RepoUser}:$RepoUser /opt/trickster-agent/repo/trickster-agent/data
+chown -R ${REPO_USER}:${REPO_USER} /opt/trickster-agent/repo/trickster-agent/data
 echo '[3/4] restart services'
 systemctl restart trickster-agent || true
 systemctl restart trickster-admin || true
@@ -62,7 +65,9 @@ systemctl is-active trickster-agent || true
 systemctl is-active trickster-admin || true
 systemctl is-active trickster-thinker || true
 systemctl is-active trickster-objkt-worker || true
-"@
+'@
+
+$remoteCmd = $remoteCmd.Replace("__REPO_USER__", $RepoUser)
 
 Write-Host "Running on ${SshUser}@${ServerIp}: update repo + restart services" -ForegroundColor Cyan
 ssh "${SshUser}@${ServerIp}" $remoteCmd
