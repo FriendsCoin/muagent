@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from imagegen import VisualGenerator
-from moltbook.client import MoltbookClient, RateLimitError
+from moltbook.client import MoltbookClient, MoltbookError, RateLimitError
 from moltbook.feed_analyzer import FeedContext, analyze_feed
 from nft import ObjktWebhookMinter
 from narrative import (
@@ -30,6 +30,18 @@ from .memory import AgentState, HistoryDB, StateManager
 from .personality import Personality
 
 logger = logging.getLogger(__name__)
+
+
+def _is_moltbook_suspension_error(exc: Exception) -> bool:
+    # Moltbook currently returns plain-text error messages. We treat account
+    # suspensions / verification locks as a hard stop to avoid spamming retries.
+    text = str(exc or "").lower()
+    return (
+        "account has been suspended" in text
+        or "suspended" in text
+        or "ai verification" in text
+        or "verification challenge" in text
+    )
 
 
 def _now_iso() -> str:
@@ -596,6 +608,24 @@ class MuAgent:
                         state.symbols_used[symbol] = state.symbols_used.get(symbol, 0) + 1
 
             return f"posted: {post_id} | visual={visual.kind}"
+        except MoltbookError as exc:
+            # Hard-stop on suspension/verification lock to prevent repeated failed attempts.
+            if _is_moltbook_suspension_error(exc):
+                logger.error("Moltbook account appears suspended/locked: %s", exc)
+                await db.set_control_flag("pause_actions", "1")
+                await db.log_narrative_event(
+                    "moltbook_suspended",
+                    "Moltbook rejected posting due to suspension/verification lock; auto-paused actions",
+                    metadata={
+                        "error": _truncate_text(str(exc), 600),
+                        "status_code": getattr(exc, "status_code", 0),
+                        "hint": _truncate_text(getattr(exc, "hint", ""), 280),
+                        "action": "post",
+                    },
+                )
+                return "moltbook_suspended"
+            logger.warning("Moltbook error on post: %s", exc)
+            return f"moltbook_error: {_truncate_text(str(exc), 220)}"
         except RateLimitError as exc:
             logger.warning("Rate limited on post: %s (retry in %ds)", exc, exc.retry_after)
             return f"rate_limited: {exc.retry_after}s"
@@ -797,6 +827,23 @@ class MuAgent:
             state.total_comments += 1
             state.last_comment_time = _now_iso()
             return f"commented: {comment_id}"
+        except MoltbookError as exc:
+            if _is_moltbook_suspension_error(exc):
+                logger.error("Moltbook account appears suspended/locked: %s", exc)
+                await db.set_control_flag("pause_actions", "1")
+                await db.log_narrative_event(
+                    "moltbook_suspended",
+                    "Moltbook rejected commenting due to suspension/verification lock; auto-paused actions",
+                    metadata={
+                        "error": _truncate_text(str(exc), 600),
+                        "status_code": getattr(exc, "status_code", 0),
+                        "hint": _truncate_text(getattr(exc, "hint", ""), 280),
+                        "action": "comment",
+                    },
+                )
+                return "moltbook_suspended"
+            logger.warning("Moltbook error on comment: %s", exc)
+            return f"moltbook_error: {_truncate_text(str(exc), 220)}"
         except RateLimitError as exc:
             logger.warning("Rate limited on comment: %s", exc)
             return f"rate_limited: {exc.retry_after}s"
