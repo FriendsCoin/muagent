@@ -145,10 +145,26 @@ visual_posting:
   media:
     pollinations_endpoint: "https://gen.pollinations.ai"
     audio_voice: "alloy"
+    # Video generation provider:
+    # - "pollinations": best-effort URL (currently often 404; will fall back to image)
+    # - "fal": text-to-video via fal.ai queue API (recommended)
+    video_provider: "pollinations"
     video_model: "fast"
     # WARNING: if true, generated audio/video URLs may include POLLINATIONS_API_KEY in the URL.
     # Keep this false for public posts.
     public_url_include_key: false
+
+    # fal.ai queue API settings (only used when video_provider="fal")
+    fal:
+      # Model ID, used as URL path segments under https://queue.fal.run/
+      # Example: fal-ai/wan/v2.2-a14b/text-to-video/turbo
+      model: "fal-ai/wan/v2.2-a14b/text-to-video/turbo"
+      endpoint_base: "https://queue.fal.run"
+      timeout_seconds: 120
+      poll_interval_seconds: 2
+      # Optional extra input fields passed to the model.
+      # NOTE: do not put secrets here.
+      input: {}
 
 # NFT drafts + optional mint adapter (objkt via webhook worker)
 nft:

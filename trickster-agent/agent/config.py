@@ -35,6 +35,8 @@ def load_config(
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "runware_api_key": os.getenv("RUNWARE_API_KEY", ""),
         "pollinations_api_key": os.getenv("POLLINATIONS_API_KEY", ""),
+        # fal.ai queue API (text-to-video). Prefer FAL_KEY (official), but accept FAL_API_KEY too.
+        "fal_key": os.getenv("FAL_KEY", "") or os.getenv("FAL_API_KEY", ""),
         "comfyui_api_key": os.getenv("COMFYUI_API_KEY", ""),
         "admin_token": os.getenv("ADMIN_TOKEN", ""),
         "objkt_webhook_token": os.getenv("OBJKT_WEBHOOK_TOKEN", ""),

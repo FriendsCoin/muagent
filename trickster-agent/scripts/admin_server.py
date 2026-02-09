@@ -633,10 +633,18 @@ class AdminContext:
             "providers": {
                 "url_configured_provider": str(visual_cfg.get("url", {}).get("provider", "pollinations")),
                 "fallback_provider": str(visual_cfg.get("url", {}).get("fallback_provider", "pollinations")),
+                "video_provider": str(visual_cfg.get("media", {}).get("video_provider", "pollinations")),
                 "runware_key_present": runware_key_present,
                 "runware_endpoint": str(visual_cfg.get("url", {}).get("endpoint", "https://api.runware.ai/v1")),
                 "runware_max_attempts": int(visual_cfg.get("url", {}).get("runware_max_attempts", 1)),
                 "pollinations_key_present": bool(str(secrets.get("pollinations_api_key", "")).strip()),
+                "fal_key_present": bool(str(secrets.get("fal_key", "")).strip()),
+                "fal_endpoint_base": str(
+                    visual_cfg.get("media", {}).get("fal", {}).get("endpoint_base", "https://queue.fal.run")
+                ),
+                "fal_model": str(
+                    visual_cfg.get("media", {}).get("fal", {}).get("model", "fal-ai/wan/v2.2-a14b/text-to-video/turbo")
+                ),
                 "pollinations_enter_endpoint": str(
                     visual_cfg.get("url", {}).get("pollinations_enter_endpoint", "https://gen.pollinations.ai/openai")
                 ),
@@ -2352,6 +2360,8 @@ _INDEX_HTML = """<!doctype html>
         ['provider', String(effective.url_provider || 'pollinations')],
         ['fallback', String(effective.fallback_provider || ((d.providers || {}).fallback_provider || 'pollinations'))],
         ['pollinations key', String(!!((d.providers || {}).pollinations_key_present))],
+        ['video provider', String(((d.providers || {}).video_provider || 'pollinations'))],
+        ['fal key', String(!!((d.providers || {}).fal_key_present))],
         ['runware tries', String(
           (effective.runware_max_attempts_override !== null && effective.runware_max_attempts_override !== undefined)
             ? effective.runware_max_attempts_override

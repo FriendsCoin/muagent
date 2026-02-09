@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -50,6 +51,8 @@ class VisualGenerator:
             self._media_cfg.get("pollinations_endpoint", "https://gen.pollinations.ai")
         ).rstrip("/")
         self._media_public_include_key = bool(self._media_cfg.get("public_url_include_key", False))
+        self._video_provider = str(self._media_cfg.get("video_provider", "pollinations")).strip().lower() or "pollinations"
+        self._fal_cfg = self._media_cfg.get("fal", {}) if isinstance(self._media_cfg.get("fal", {}), dict) else {}
 
     def generate(
         self,
@@ -173,6 +176,27 @@ class VisualGenerator:
         )
 
     def _generate_video(self, *, prompt: str) -> VisualAttachment:
+        provider = self._video_provider
+        if provider == "fal":
+            visual, reason, detail = self._generate_fal_video_url(prompt=prompt)
+            if visual is not None:
+                return visual
+            # Fall back to pollinations URL (and higher-level pipeline may fall back further to image).
+            fallback = self._generate_pollinations_video_url(prompt=prompt)
+            fallback.meta = dict(fallback.meta or {})
+            fallback.meta.update(
+                {
+                    "video_provider_requested": "fal",
+                    "fal_fallback_used": True,
+                    "fal_error_reason": reason,
+                    "fal_error_detail": detail,
+                    "fallback_provider_used": "pollinations_video",
+                }
+            )
+            return fallback
+        return self._generate_pollinations_video_url(prompt=prompt)
+
+    def _generate_pollinations_video_url(self, *, prompt: str) -> VisualAttachment:
         model = str(self._media_cfg.get("video_model", "fast")).strip() or "fast"
         prompt_clean = " ".join(str(prompt or "").split())
         seed_base = hashlib.sha1(f"video:{prompt_clean}".encode("utf-8")).hexdigest()
@@ -197,6 +221,176 @@ class VisualGenerator:
                 "key_in_url": bool(self._media_public_include_key and self._pollinations_key_query()),
             },
         )
+
+    def _generate_fal_video_url(self, *, prompt: str) -> tuple[VisualAttachment | None, str, str]:
+        api_key = str(self._secrets.get("fal_key", "")).strip()
+        if not api_key:
+            return None, "no_key", "FAL_KEY missing"
+
+        prompt_clean = " ".join(str(prompt or "").split())
+        if not prompt_clean:
+            return None, "empty_prompt", "empty prompt"
+
+        model_id = str(self._fal_cfg.get("model", "fal-ai/wan/v2.2-a14b/text-to-video/turbo")).strip().strip("/")
+        base = str(self._fal_cfg.get("endpoint_base", "https://queue.fal.run")).strip().rstrip("/")
+        timeout_seconds = float(self._fal_cfg.get("timeout_seconds", 120))
+        poll_interval = float(self._fal_cfg.get("poll_interval_seconds", 2))
+        extra_input = self._fal_cfg.get("input", {})
+        if not isinstance(extra_input, dict):
+            extra_input = {}
+
+        submit_url = f"{base}/{model_id}"
+        headers = {"Authorization": f"Key {api_key}", "Content-Type": "application/json"}
+        payload: dict[str, Any] = {"prompt": prompt_clean}
+        payload.update(extra_input)
+
+        request_id = ""
+        try:
+            resp = httpx.post(submit_url, json=payload, headers=headers, timeout=timeout_seconds)
+            resp.raise_for_status()
+            body = resp.json()
+        except httpx.TimeoutException as exc:
+            return None, "timeout", str(exc)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            raw = ""
+            if exc.response is not None:
+                raw = exc.response.text[:220]
+            return None, f"http_{status_code}", raw
+        except httpx.RequestError as exc:
+            return None, "network_error", str(exc)
+        except ValueError as exc:
+            return None, "invalid_json", str(exc)
+        except Exception:
+            return None, "unknown_error", ""
+
+        if isinstance(body, dict):
+            request_id = str(body.get("request_id") or body.get("requestId") or body.get("id") or "").strip()
+            # Some variants return a nested request object.
+            if not request_id and isinstance(body.get("request"), dict):
+                request_id = str(body["request"].get("id") or body["request"].get("request_id") or "").strip()
+
+        if not request_id:
+            # If a provider ever returns a direct URL without queue semantics, try to parse it.
+            direct_url = self._extract_video_url(body)
+            if direct_url:
+                return (
+                    VisualAttachment(
+                        kind="url",
+                        provider="fal_video",
+                        prompt=prompt_clean,
+                        url=direct_url,
+                        meta={
+                            "media_type": "video",
+                            "video_provider": "fal",
+                            "fal_model": model_id,
+                            "fal_request_id": "",
+                        },
+                    ),
+                    "",
+                    "",
+                )
+            return None, "missing_request_id", "fal response missing request_id"
+
+        # Poll status until completed or timeout.
+        status_url = f"{base}/{model_id}/requests/{quote(request_id, safe='')}/status"
+        result_url = f"{base}/{model_id}/requests/{quote(request_id, safe='')}"
+        deadline = time.time() + timeout_seconds
+        last_status = ""
+        while time.time() < deadline:
+            try:
+                s = httpx.get(status_url, headers=headers, timeout=20)
+                s.raise_for_status()
+                status_body = s.json()
+            except Exception as exc:
+                last_status = f"status_error:{type(exc).__name__}"
+                time.sleep(max(0.3, poll_interval))
+                continue
+
+            status_value = ""
+            if isinstance(status_body, dict):
+                status_value = str(status_body.get("status") or status_body.get("state") or "").strip().lower()
+                if not status_value and isinstance(status_body.get("request"), dict):
+                    status_value = str(status_body["request"].get("status") or "").strip().lower()
+            last_status = status_value or last_status
+            if status_value in {"completed", "succeeded", "success", "done"}:
+                break
+            if status_value in {"failed", "error", "canceled", "cancelled"}:
+                detail = ""
+                if isinstance(status_body, dict):
+                    detail = str(status_body.get("error") or status_body.get("message") or "")[:220]
+                return None, "failed", detail
+            time.sleep(max(0.3, poll_interval))
+        else:
+            return None, "timeout_waiting", f"last_status={last_status}"
+
+        try:
+            r = httpx.get(result_url, headers=headers, timeout=30)
+            r.raise_for_status()
+            result_body = r.json()
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            raw = ""
+            if exc.response is not None:
+                raw = exc.response.text[:220]
+            return None, f"http_{status_code}", raw
+        except Exception as exc:
+            return None, "result_error", str(exc)
+
+        video_url = self._extract_video_url(result_body)
+        if not video_url:
+            return None, "empty_result", "fal result missing video url"
+
+        return (
+            VisualAttachment(
+                kind="url",
+                provider="fal_video",
+                prompt=prompt_clean,
+                url=video_url,
+                meta={
+                    "media_type": "video",
+                    "video_provider": "fal",
+                    "fal_model": model_id,
+                    "fal_request_id": request_id,
+                },
+            ),
+            "",
+            "",
+        )
+
+    @staticmethod
+    def _extract_video_url(body: Any) -> str:
+        if isinstance(body, dict):
+            # Common shapes:
+            # - {"video": {"url": "..."}}
+            # - {"videos": [{"url": "..."}]}
+            # - {"output": {"video": {"url": "..."}}}
+            for path in [
+                ("video", "url"),
+                ("output", "video", "url"),
+            ]:
+                cur: Any = body
+                ok = True
+                for key in path:
+                    if isinstance(cur, dict) and key in cur:
+                        cur = cur[key]
+                    else:
+                        ok = False
+                        break
+                if ok and isinstance(cur, str) and cur.strip().startswith("http"):
+                    return cur.strip()
+
+            videos = body.get("videos")
+            if isinstance(videos, list):
+                for item in videos:
+                    if isinstance(item, dict):
+                        url = str(item.get("url") or item.get("video_url") or "").strip()
+                        if url.startswith("http"):
+                            return url
+            url = str(body.get("url") or body.get("video_url") or "").strip()
+            if url.startswith("http"):
+                return url
+        return ""
 
     @staticmethod
     def _build_prompt(*, theme: str, mood: str, phase: str, day: int, context: str) -> str:
