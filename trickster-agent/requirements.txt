@@ -5,6 +5,10 @@ python-dotenv>=1.0        # .env file loading
 click>=8.1                # CLI framework
 pydantic>=2.7,<3.0        # API models and validation
 
+# Web server (admin API)
+fastapi>=0.115            # Admin REST API with CORS
+uvicorn[standard]>=0.32   # ASGI server for FastAPI
+
 # AI
 anthropic>=0.40           # Claude LLM for personality
 

@@ -1,11 +1,19 @@
 """Admin UI and control plane for Mu.
 
+FastAPI server with CORS support for the React dashboard (trickster-command).
+
 Features:
 - Status/activity/log/reasoning visibility
 - Observe and influence chat modes
 - Runtime controls (pause, run-once, reload framework)
 - Optional conscious framework context
 - Debug snapshot endpoint
+- CORS enabled for cross-origin React dashboard
+
+Usage:
+    python scripts/admin_server.py                    # default 0.0.0.0:8000
+    python scripts/admin_server.py --port 8787        # custom port
+    python scripts/admin_server.py --admin-token abc  # require auth token
 """
 
 from __future__ import annotations
@@ -22,7 +30,9 @@ import uuid
 import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from fastapi import FastAPI, HTTPException, Query, Body, Request, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -1387,1275 +1397,446 @@ class AdminContext:
         return asyncio.run(self._delete_post_async(post_id))
 
 
-class AdminHandler(BaseHTTPRequestHandler):
-    ctx: AdminContext
+# ======================================================================
+# FastAPI Application (replaces AdminHandler)
+# ======================================================================
 
-    def _send_json(self, status: int, payload: dict) -> None:
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+app = FastAPI(title="Mu Admin Console", description="Control plane for the Mu trickster agent")
 
-    def _send_html(self, html: str) -> None:
-        body = html.encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify the exact React app URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-    def _request_token(self) -> str:
-        parsed = urlparse(self.path)
-        q = parse_qs(parsed.query)
-        if q.get("token"):
-            return q["token"][0]
-        return self.headers.get("X-Admin-Token", "")
+# Global context — set during startup
+_ctx: AdminContext | None = None
 
-    def _auth_ok(self) -> bool:
-        token = self.ctx.admin_token.strip()
-        if not token:
-            return True
-        supplied = self._request_token()
-        return supplied == token
 
-    def _read_body_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
-        raw = self.rfile.read(length) if length > 0 else b""
-        if not raw:
-            return {}
+def get_ctx() -> AdminContext:
+    if _ctx is None:
+        raise HTTPException(status_code=500, detail="Server not initialized")
+    return _ctx
+
+
+def verify_auth(
+    request: Request,
+    x_admin_token: str = Header(default=""),
+) -> AdminContext:
+    ctx = get_ctx()
+    token = ctx.admin_token.strip()
+    if not token:
+        return ctx
+    supplied = request.query_params.get("token", "") or x_admin_token
+    if supplied != token:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return ctx
+
+
+# ── Fallback HTML admin panel ────────────────────────────────────
+
+_ADMIN_HTML_PATH = Path(__file__).resolve().parent / "admin_index.html"
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    if _ADMIN_HTML_PATH.exists():
+        return HTMLResponse(_ADMIN_HTML_PATH.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>Mu Admin</h1><p>admin_index.html not found. Use the React dashboard.</p>")
+
+
+# ── GET endpoints ────────────────────────────────────────────────
+
+
+@app.get("/api/status")
+def api_status(ctx: AdminContext = Depends(verify_auth)):
+    state = ctx.load_state()
+    counts = ctx.fetch_counts()
+    return {
+        "state": state,
+        "counts": counts,
+        "post_activity": ctx.fetch_post_activity(),
+        "control_flags": ctx.get_control_flags(),
+        "conscious_framework": {
+            "dir": str(ctx.framework_dir),
+            "available": ctx.framework.available,
+        },
+    }
+
+
+@app.get("/api/post_activity")
+def api_post_activity(ctx: AdminContext = Depends(verify_auth)):
+    return ctx.fetch_post_activity()
+
+
+@app.get("/api/visual/status")
+def api_visual_status(
+    limit: int = Query(20, ge=1, le=200),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    return ctx.fetch_visual_status(limit=limit)
+
+
+@app.get("/api/visual/why")
+def api_visual_why(
+    limit: int = Query(20, ge=1, le=200),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    return ctx.fetch_visual_why(limit=limit)
+
+
+@app.get("/api/nft/status")
+def api_nft_status(
+    limit: int = Query(20, ge=1, le=200),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    return ctx.fetch_nft_status(limit=limit)
+
+
+@app.get("/api/activity")
+def api_activity(
+    limit: int = Query(20, ge=1, le=100),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    return {
+        "posts": ctx.fetch_recent("posts", limit),
+        "comments": ctx.fetch_recent("comments", limit),
+        "narrative_events": ctx.fetch_recent("narrative_events", limit),
+        "safety_events": ctx.fetch_safety_events(limit),
+        "operator_commands": ctx.fetch_recent("operator_commands", limit),
+        "thoughts": ctx.fetch_recent("thought_journal", limit),
+        "reasoning_traces": ctx.fetch_recent("reasoning_trace", limit),
+    }
+
+
+@app.get("/api/timeline")
+def api_timeline(
+    limit: int = Query(20, ge=1, le=200),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    return {"items": ctx.fetch_timeline(limit=limit), "limit": limit}
+
+
+@app.get("/api/safety")
+def api_safety(
+    limit: int = Query(20, ge=1, le=200),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    return {"events": ctx.fetch_safety_events(limit=limit), "limit": limit}
+
+
+@app.get("/api/reasoning")
+def api_reasoning(
+    limit: int = Query(20, ge=1, le=200),
+    source: str = Query(""),
+    action_type: str = Query(""),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    traces = ctx.fetch_reasoning(
+        limit=limit,
+        source=source.strip(),
+        action_type=action_type.strip(),
+    )
+    return {
+        "traces": traces,
+        "filters": {
+            "source": source.strip(),
+            "action_type": action_type.strip(),
+            "limit": limit,
+        },
+    }
+
+
+@app.get("/api/logs")
+def api_logs(
+    lines: int = Query(200, ge=10, le=2000),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    return {"lines": _tail_lines(ctx.log_path, lines)}
+
+
+@app.get("/api/debug/runtime")
+def api_debug_runtime(ctx: AdminContext = Depends(verify_auth)):
+    return ctx.runtime_snapshot()
+
+
+# ── POST endpoints ───────────────────────────────────────────────
+
+
+@app.post("/api/chat")
+def api_chat(body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)):
+    mode = str(body.get("mode", "observe")).lower()
+    question = str(body.get("question", "")).strip()
+    instruction = str(body.get("instruction", "")).strip()
+    conscious = _to_bool(body.get("conscious", False), default=False)
+
+    if not question and not instruction:
+        raise HTTPException(400, "question_or_instruction_required")
+
+    prompt = question or instruction
+
+    try:
+        reply = ctx.generate_reply(prompt=prompt, mode=mode, conscious=conscious)
+    except Exception as exc:
+        raise HTTPException(500, f"llm_error: {exc}")
+
+    thought_id = ctx.log_thought(
+        source="admin", mode=mode, prompt=prompt, content=reply
+    )
+
+    command_id = ""
+    if mode == "influence":
+        command_id = ctx.enqueue_influence(
+            question=question or prompt,
+            instruction=instruction or prompt,
+        )
+
+    return {
+        "reply": reply,
+        "mode": mode,
+        "conscious": conscious,
+        "queued": bool(command_id),
+        "command_id": command_id,
+        "thought_id": thought_id,
+    }
+
+
+@app.post("/api/conscious/think")
+def api_conscious_think(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    conscious = _to_bool(body.get("conscious", True), default=True)
+    try:
+        thought_id, thought = ctx.generate_autonomous_thought(conscious=conscious)
+    except Exception as exc:
+        raise HTTPException(500, f"llm_error: {exc}")
+    return {"thought_id": thought_id, "thought": thought, "conscious": conscious}
+
+
+@app.post("/api/control/pause")
+def api_control_pause(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    paused = _to_bool(body.get("paused", True), default=True)
+    flags = ctx.set_pause_actions(paused)
+    return {"ok": True, "paused": paused, "control_flags": flags}
+
+
+@app.post("/api/control/moltbook")
+def api_control_moltbook(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    writes_enabled = _to_bool(body.get("writes_enabled", True), default=True)
+    ctx.set_control_flag("moltbook_write_enabled", "1" if writes_enabled else "0")
+    return {"ok": True, "control_flags": ctx.get_control_flags()}
+
+
+@app.post("/api/control/reload_framework")
+def api_control_reload_framework(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    ctx.reload_framework()
+    return {
+        "ok": True,
+        "framework": {
+            "dir": str(ctx.framework_dir),
+            "available": ctx.framework.available,
+        },
+    }
+
+
+@app.post("/api/control/thinker")
+def api_control_thinker(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    enabled = _to_bool(body.get("enabled", False), default=False)
+    mode = str(body.get("mode", "queue")).strip().lower()
+    auto_queue = _to_bool(body.get("auto_queue", True), default=True)
+    if mode not in {"queue", "interval"}:
+        raise HTTPException(400, "invalid_mode")
+    ctx.set_control_flag("thinker_enabled", "1" if enabled else "0")
+    ctx.set_control_flag("thinker_mode", mode)
+    ctx.set_control_flag("thinker_auto_queue", "1" if auto_queue else "0")
+    return {"ok": True, "control_flags": ctx.get_control_flags()}
+
+
+@app.post("/api/control/visual")
+def api_control_visual(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    enabled = _to_bool(body.get("enabled", True), default=True)
+    mode = str(body.get("mode", "auto")).strip().lower()
+    provider = str(body.get("url_provider", "")).strip().lower()
+    fallback_provider = str(body.get("fallback_provider", "")).strip().lower()
+    video_provider = str(body.get("video_provider", "")).strip().lower()
+    runware_attempts_raw = str(body.get("runware_max_attempts", "")).strip()
+    attach_probability_raw = str(body.get("attach_probability", "")).strip()
+
+    if mode not in {"auto", "url", "ascii", "audio", "video", "off"}:
+        raise HTTPException(400, "invalid_mode")
+    if provider and provider not in {"pollinations", "pollinations_enter", "runware"}:
+        raise HTTPException(400, "invalid_provider")
+    if fallback_provider and fallback_provider not in {"pollinations", "ascii"}:
+        raise HTTPException(400, "invalid_fallback_provider")
+    if video_provider and video_provider not in {"pollinations", "fal"}:
+        raise HTTPException(400, "invalid_video_provider")
+
+    ctx.set_control_flag("visual_enabled", "1" if enabled else "0")
+    ctx.set_control_flag("visual_mode", mode)
+    if provider:
+        ctx.set_control_flag("visual_url_provider", provider)
+    if fallback_provider:
+        ctx.set_control_flag("visual_fallback_provider", fallback_provider)
+    if video_provider:
+        ctx.set_control_flag("visual_video_provider", video_provider)
+
+    if runware_attempts_raw:
         try:
-            return json.loads(raw.decode("utf-8"))
-        except Exception:
-            raise ValueError("invalid_json")
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if path == "/":
-            self._send_html(_INDEX_HTML)
-            return
-
-        if path == "/favicon.ico":
-            self.send_response(204)
-            self.end_headers()
-            return
-
-        if not self._auth_ok():
-            self._send_json(401, {"error": "unauthorized"})
-            return
-
-        if path == "/api/status":
-            state = self.ctx.load_state()
-            counts = self.ctx.fetch_counts()
-            self._send_json(
-                200,
-                {
-                    "state": state,
-                    "counts": counts,
-                    "post_activity": self.ctx.fetch_post_activity(),
-                    "control_flags": self.ctx.get_control_flags(),
-                    "conscious_framework": {
-                        "dir": str(self.ctx.framework_dir),
-                        "available": self.ctx.framework.available,
-                    },
-                },
-            )
-            return
-
-        if path == "/api/post_activity":
-            self._send_json(200, self.ctx.fetch_post_activity())
-            return
-
-        if path == "/api/visual/status":
-            params = parse_qs(parsed.query)
-            try:
-                limit = int(params.get("limit", ["20"])[0])
-            except ValueError:
-                limit = 20
-            limit = max(1, min(200, limit))
-            self._send_json(200, self.ctx.fetch_visual_status(limit=limit))
-            return
-
-        if path == "/api/visual/why":
-            params = parse_qs(parsed.query)
-            try:
-                limit = int(params.get("limit", ["20"])[0])
-            except ValueError:
-                limit = 20
-            limit = max(1, min(200, limit))
-            self._send_json(200, self.ctx.fetch_visual_why(limit=limit))
-            return
-
-        if path == "/api/nft/status":
-            params = parse_qs(parsed.query)
-            try:
-                limit = int(params.get("limit", ["20"])[0])
-            except ValueError:
-                limit = 20
-            limit = max(1, min(200, limit))
-            self._send_json(200, self.ctx.fetch_nft_status(limit=limit))
-            return
-
-        if path == "/api/activity":
-            params = parse_qs(parsed.query)
-            try:
-                limit = int(params.get("limit", ["20"])[0])
-            except ValueError:
-                limit = 20
-            limit = max(1, min(100, limit))
-            payload = {
-                "posts": self.ctx.fetch_recent("posts", limit),
-                "comments": self.ctx.fetch_recent("comments", limit),
-                "narrative_events": self.ctx.fetch_recent("narrative_events", limit),
-                "safety_events": self.ctx.fetch_safety_events(limit),
-                "operator_commands": self.ctx.fetch_recent("operator_commands", limit),
-                "thoughts": self.ctx.fetch_recent("thought_journal", limit),
-                "reasoning_traces": self.ctx.fetch_recent("reasoning_trace", limit),
-            }
-            self._send_json(200, payload)
-            return
-
-        if path == "/api/timeline":
-            params = parse_qs(parsed.query)
-            try:
-                limit = int(params.get("limit", ["20"])[0])
-            except ValueError:
-                limit = 20
-            limit = max(1, min(200, limit))
-            self._send_json(200, {"items": self.ctx.fetch_timeline(limit=limit), "limit": limit})
-            return
-
-        if path == "/api/safety":
-            params = parse_qs(parsed.query)
-            try:
-                limit = int(params.get("limit", ["20"])[0])
-            except ValueError:
-                limit = 20
-            limit = max(1, min(200, limit))
-            self._send_json(200, {"events": self.ctx.fetch_safety_events(limit=limit), "limit": limit})
-            return
-
-        if path == "/api/reasoning":
-            params = parse_qs(parsed.query)
-            try:
-                limit = int(params.get("limit", ["20"])[0])
-            except ValueError:
-                limit = 20
-            limit = max(1, min(200, limit))
-            source = str(params.get("source", [""])[0]).strip()
-            action_type = str(params.get("action_type", [""])[0]).strip()
-            traces = self.ctx.fetch_reasoning(limit=limit, source=source, action_type=action_type)
-            self._send_json(
-                200,
-                {
-                    "traces": traces,
-                    "filters": {"source": source, "action_type": action_type, "limit": limit},
-                },
-            )
-            return
-
-        if path == "/api/logs":
-            params = parse_qs(parsed.query)
-            try:
-                lines = int(params.get("lines", ["200"])[0])
-            except ValueError:
-                lines = 200
-            lines = max(10, min(2000, lines))
-            self._send_json(200, {"lines": _tail_lines(self.ctx.log_path, lines)})
-            return
-
-        if path == "/api/debug/runtime":
-            self._send_json(200, self.ctx.runtime_snapshot())
-            return
-
-        self._send_json(404, {"error": "not_found"})
-
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path
-
-        if not self._auth_ok():
-            self._send_json(401, {"error": "unauthorized"})
-            return
-
-        try:
-            body = self._read_body_json()
+            attempts = max(1, min(5, int(runware_attempts_raw)))
         except ValueError:
-            self._send_json(400, {"error": "invalid_json"})
-            return
+            raise HTTPException(400, "invalid_runware_max_attempts")
+        ctx.set_control_flag("visual_runware_max_attempts", str(attempts))
+    else:
+        ctx.set_control_flag("visual_runware_max_attempts", "")
 
-        if path == "/api/chat":
-            mode = str(body.get("mode", "observe")).lower()
-            question = str(body.get("question", "")).strip()
-            instruction = str(body.get("instruction", "")).strip()
-            conscious = _to_bool(body.get("conscious", False), default=False)
+    if attach_probability_raw:
+        try:
+            prob = max(0.0, min(1.0, float(attach_probability_raw)))
+        except ValueError:
+            raise HTTPException(400, "invalid_attach_probability")
+        ctx.set_control_flag("visual_attach_probability", f"{prob:.3f}")
+    else:
+        ctx.set_control_flag("visual_attach_probability", "")
 
-            if not question and not instruction:
-                self._send_json(400, {"error": "question_or_instruction_required"})
-                return
-
-            prompt = question or instruction
-
-            try:
-                reply = self.ctx.generate_reply(prompt=prompt, mode=mode, conscious=conscious)
-            except Exception as exc:
-                self._send_json(500, {"error": f"llm_error: {exc}"})
-                return
-
-            thought_id = self.ctx.log_thought(
-                source="admin",
-                mode=mode,
-                prompt=prompt,
-                content=reply,
-            )
-
-            command_id = ""
-            if mode == "influence":
-                command_id = self.ctx.enqueue_influence(
-                    question=question or prompt,
-                    instruction=instruction or prompt,
-                )
-
-            self._send_json(
-                200,
-                {
-                    "reply": reply,
-                    "mode": mode,
-                    "conscious": conscious,
-                    "queued": bool(command_id),
-                    "command_id": command_id,
-                    "thought_id": thought_id,
-                },
-            )
-            return
-
-        if path == "/api/conscious/think":
-            conscious = _to_bool(body.get("conscious", True), default=True)
-            try:
-                thought_id, thought = self.ctx.generate_autonomous_thought(conscious=conscious)
-            except Exception as exc:
-                self._send_json(500, {"error": f"llm_error: {exc}"})
-                return
-            self._send_json(200, {"thought_id": thought_id, "thought": thought, "conscious": conscious})
-            return
-
-        if path == "/api/control/pause":
-            paused = _to_bool(body.get("paused", True), default=True)
-            flags = self.ctx.set_pause_actions(paused)
-            self._send_json(200, {"ok": True, "paused": paused, "control_flags": flags})
-            return
-
-        if path == "/api/control/moltbook":
-            writes_enabled = _to_bool(body.get("writes_enabled", True), default=True)
-            self.ctx.set_control_flag("moltbook_write_enabled", "1" if writes_enabled else "0")
-            self._send_json(200, {"ok": True, "control_flags": self.ctx.get_control_flags()})
-            return
-
-        if path == "/api/control/reload_framework":
-            self.ctx.reload_framework()
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "framework": {
-                        "dir": str(self.ctx.framework_dir),
-                        "available": self.ctx.framework.available,
-                    },
-                },
-            )
-            return
-
-        if path == "/api/control/thinker":
-            enabled = _to_bool(body.get("enabled", False), default=False)
-            mode = str(body.get("mode", "queue")).strip().lower()
-            auto_queue = _to_bool(body.get("auto_queue", True), default=True)
-            if mode not in {"queue", "interval"}:
-                self._send_json(400, {"error": "invalid_mode"})
-                return
-            self.ctx.set_control_flag("thinker_enabled", "1" if enabled else "0")
-            self.ctx.set_control_flag("thinker_mode", mode)
-            self.ctx.set_control_flag("thinker_auto_queue", "1" if auto_queue else "0")
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "control_flags": self.ctx.get_control_flags(),
-                },
-            )
-            return
-
-        if path == "/api/control/visual":
-            enabled = _to_bool(body.get("enabled", True), default=True)
-            mode = str(body.get("mode", "auto")).strip().lower()
-            provider = str(body.get("url_provider", "")).strip().lower()
-            fallback_provider = str(body.get("fallback_provider", "")).strip().lower()
-            video_provider = str(body.get("video_provider", "")).strip().lower()
-            runware_attempts_raw = str(body.get("runware_max_attempts", "")).strip()
-            attach_probability_raw = str(body.get("attach_probability", "")).strip()
-            if mode not in {"auto", "url", "ascii", "audio", "video", "off"}:
-                self._send_json(400, {"error": "invalid_mode"})
-                return
-            if provider and provider not in {"pollinations", "pollinations_enter", "runware"}:
-                self._send_json(400, {"error": "invalid_provider"})
-                return
-            if fallback_provider and fallback_provider not in {"pollinations", "ascii"}:
-                self._send_json(400, {"error": "invalid_fallback_provider"})
-                return
-            if video_provider and video_provider not in {"pollinations", "fal"}:
-                self._send_json(400, {"error": "invalid_video_provider"})
-                return
-
-            self.ctx.set_control_flag("visual_enabled", "1" if enabled else "0")
-            self.ctx.set_control_flag("visual_mode", mode)
-            if provider:
-                self.ctx.set_control_flag("visual_url_provider", provider)
-            if fallback_provider:
-                self.ctx.set_control_flag("visual_fallback_provider", fallback_provider)
-            if video_provider:
-                self.ctx.set_control_flag("visual_video_provider", video_provider)
-
-            if runware_attempts_raw:
-                try:
-                    attempts = max(1, min(5, int(runware_attempts_raw)))
-                except ValueError:
-                    self._send_json(400, {"error": "invalid_runware_max_attempts"})
-                    return
-                self.ctx.set_control_flag("visual_runware_max_attempts", str(attempts))
-            else:
-                self.ctx.set_control_flag("visual_runware_max_attempts", "")
-
-            if attach_probability_raw:
-                try:
-                    prob = max(0.0, min(1.0, float(attach_probability_raw)))
-                except ValueError:
-                    self._send_json(400, {"error": "invalid_attach_probability"})
-                    return
-                self.ctx.set_control_flag("visual_attach_probability", f"{prob:.3f}")
-            else:
-                self.ctx.set_control_flag("visual_attach_probability", "")
-
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "control_flags": self.ctx.get_control_flags(),
-                    "visual_status": self.ctx.fetch_visual_status(limit=10),
-                },
-            )
-            return
-
-        if path == "/api/visual/test":
-            prompt = str(body.get("prompt", "")).strip()
-            mode = str(body.get("mode", "auto")).strip().lower()
-            video_provider = str(body.get("video_provider", "")).strip().lower()
-            phase = str(body.get("phase", "emergence")).strip().lower() or "emergence"
-            try:
-                day = int(body.get("day", 1))
-            except (TypeError, ValueError):
-                day = 1
-            if mode not in {"auto", "url", "ascii", "audio", "video"}:
-                self._send_json(400, {"error": "invalid_mode"})
-                return
-            if video_provider and video_provider not in {"pollinations", "fal"}:
-                self._send_json(400, {"error": "invalid_video_provider"})
-                return
-            payload = self.ctx.test_visual_generation(
-                prompt=prompt or "mu glitch consciousness",
-                mode=mode,
-                phase=phase,
-                day=max(1, day),
-                video_provider=video_provider,
-            )
-            self._send_json(200, payload)
-            return
-
-        if path == "/api/control/nft":
-            enabled = _to_bool(body.get("enabled", False), default=False)
-            mode = str(body.get("mode", "draft")).strip().lower()
-            auto_draft = _to_bool(body.get("auto_draft", True), default=True)
-            if mode not in {"off", "draft", "manual", "auto"}:
-                self._send_json(400, {"error": "invalid_mode"})
-                return
-            self.ctx.set_control_flag("nft_enabled", "1" if enabled else "0")
-            self.ctx.set_control_flag("nft_mode", mode)
-            self.ctx.set_control_flag("nft_auto_draft", "1" if auto_draft else "0")
-            self._send_json(
-                200,
-                {
-                    "ok": True,
-                    "control_flags": self.ctx.get_control_flags(),
-                    "nft_status": self.ctx.fetch_nft_status(limit=10),
-                },
-            )
-            return
-
-        if path == "/api/nft/draft":
-            post_ref = str(body.get("post_id", "")).strip()
-            try:
-                result = self.ctx.create_nft_draft_from_post(post_ref=post_ref)
-            except ValueError as exc:
-                self._send_json(400, {"error": str(exc)})
-                return
-            except Exception as exc:
-                self._send_json(500, {"error": f"draft_failed: {exc}"})
-                return
-            self._send_json(200, result)
-            return
-
-        if path == "/api/nft/mint":
-            draft_id = str(body.get("draft_id", "")).strip()
-            confirm_text = str(body.get("confirm_text", "")).strip().upper()
-            if not draft_id:
-                self._send_json(400, {"error": "draft_id_required"})
-                return
-            if confirm_text != "MINT":
-                self._send_json(400, {"error": "confirm_text_must_be_MINT"})
-                return
-            try:
-                result = self.ctx.mint_nft_draft(draft_id)
-            except ValueError as exc:
-                self._send_json(400, {"error": str(exc)})
-                return
-            except Exception as exc:
-                self._send_json(500, {"error": f"mint_failed: {exc}"})
-                return
-            self._send_json(200, result)
-            return
-
-        if path == "/api/control/run_once":
-            dry_run = _to_bool(body.get("dry_run", True), default=True)
-            timeout_seconds = int(body.get("timeout_seconds", 240))
-            try:
-                result = self.ctx.run_once(dry_run=dry_run, timeout_seconds=timeout_seconds)
-            except subprocess.TimeoutExpired:
-                self._send_json(504, {"error": "run_once_timeout"})
-                return
-            except Exception as exc:
-                self._send_json(500, {"error": f"run_once_failed: {exc}"})
-                return
-            self._send_json(200, result)
-            return
-
-        if path == "/api/control/delete_post":
-            post_id = str(body.get("post_id", "")).strip()
-            confirm_text = str(body.get("confirm_text", "")).strip().upper()
-            if not post_id:
-                self._send_json(400, {"error": "post_id_required"})
-                return
-            if confirm_text != "DELETE":
-                self._send_json(400, {"error": "confirm_text_must_be_DELETE"})
-                return
-            try:
-                deleted = self.ctx.delete_post(post_id)
-            except Exception as exc:
-                self._send_json(500, {"error": f"delete_post_failed: {exc}"})
-                return
-            self._send_json(200, {"ok": True, "deleted": deleted})
-            return
-
-        self._send_json(404, {"error": "not_found"})
-
-
-_INDEX_HTML = """<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Mu Admin</title>
-  <style>
-    :root {
-      --bg: #0f1115;
-      --card: #171a21;
-      --fg: #e8edf3;
-      --muted: #98a1ad;
-      --accent: #5db2ff;
-      --good: #76d672;
-      --bad: #ff6d6d;
-      --warn: #ffd166;
-      --border: #2b3240;
-    }
-    body { margin: 0; font-family: "Segoe UI", sans-serif; background: var(--bg); color: var(--fg); }
-    .wrap { max-width: 1280px; margin: 24px auto; padding: 0 16px; }
-    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
-    .card { border: 1px solid var(--border); background: var(--card); border-radius: 12px; padding: 12px; }
-    h1 { margin: 0 0 12px 0; font-size: 24px; }
-    h2 { margin: 0 0 10px 0; font-size: 16px; color: var(--accent); }
-    .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; max-height: 340px; overflow: auto; word-break: break-word; }
-    input, textarea, select, button {
-      background: #0f131b; color: var(--fg); border: 1px solid var(--border); border-radius: 8px; padding: 8px;
-    }
-    textarea { width: 100%; min-height: 90px; }
-    button { cursor: pointer; }
-    .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
-    .tabs { display: flex; gap: 8px; margin: 10px 0 14px 0; flex-wrap: wrap; }
-    .tab-btn { border-radius: 999px; padding: 6px 12px; }
-    .tab-btn.active { border-color: var(--accent); color: var(--accent); }
-    .tab-card { display: block; }
-    .kv { display: grid; grid-template-columns: 180px 1fr; gap: 6px 10px; font-size: 12px; }
-    .kv b { color: var(--muted); font-weight: 600; }
-    details { border-top: 1px dashed var(--border); padding-top: 8px; margin-top: 8px; }
-    summary { cursor: pointer; color: var(--muted); font-size: 12px; }
-    .muted { color: var(--muted); font-size: 12px; }
-    .ok { color: var(--good); }
-    .err { color: var(--bad); }
-    .warn { color: var(--warn); }
-    .pill { padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border); font-size: 12px; }
-    @media (max-width: 980px) { .grid { grid-template-columns: 1fr; } }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>Mu Admin Console</h1>
-    <div class="row">
-      <input id="token" type="text" placeholder="Admin token (optional)" />
-      <button onclick="refreshAll()">Refresh</button>
-      <label class="muted"><input id="conscious" type="checkbox" checked /> conscious framework</label>
-      <span id="health" class="pill muted">loading</span>
-      <span id="pauseState" class="pill muted">pause: unknown</span>
-      <span id="runwareState" class="pill muted">runware: unknown</span>
-      <span id="nftState" class="pill muted">nft: unknown</span>
-    </div>
-    <div class="tabs">
-      <button id="tab-dashboard" class="tab-btn active" onclick="showTab('dashboard')">Dashboard</button>
-      <button id="tab-operations" class="tab-btn" onclick="showTab('operations')">Operations</button>
-      <button id="tab-content" class="tab-btn" onclick="showTab('content')">Content</button>
-      <button id="tab-nft" class="tab-btn" onclick="showTab('nft')">NFT</button>
-      <button id="tab-system" class="tab-btn" onclick="showTab('system')">System</button>
-    </div>
-    <div class="grid">
-      <div class="card tab-card" data-tab="dashboard">
-        <h2>Status</h2>
-        <div id="statusSummary" class="kv"></div>
-        <details>
-          <summary>Raw JSON</summary>
-          <div id="status" class="mono">loading...</div>
-        </details>
-      </div>
-
-      <div class="card tab-card" data-tab="dashboard">
-        <h2>Post Activity</h2>
-        <div id="postActivitySummary" class="kv"></div>
-        <details>
-          <summary>Raw JSON</summary>
-          <div id="postActivity" class="mono">loading...</div>
-        </details>
-      </div>
-
-      <div class="card tab-card" data-tab="content">
-        <h2>Visual Generation</h2>
-        <div class="row">
-          <label class="muted"><input id="visualEnabled" type="checkbox" checked /> enabled</label>
-          <label class="muted">mode</label>
-          <select id="visualMode">
-            <option value="auto" selected>auto</option>
-            <option value="url">url</option>
-            <option value="ascii">ascii</option>
-            <option value="audio">audio</option>
-            <option value="video">video</option>
-            <option value="off">off</option>
-          </select>
-          <label class="muted">provider</label>
-          <select id="visualProvider">
-            <option value="pollinations" selected>pollinations</option>
-            <option value="pollinations_enter">pollinations_enter</option>
-            <option value="runware">runware</option>
-          </select>
-          <label class="muted">video</label>
-          <select id="visualVideoProvider">
-            <option value="pollinations" selected>pollinations</option>
-            <option value="fal">fal</option>
-          </select>
-          <label class="muted">fallback</label>
-          <select id="visualFallbackProvider">
-            <option value="pollinations" selected>pollinations</option>
-            <option value="ascii">ascii</option>
-          </select>
-          <label class="muted">runware tries</label>
-          <input id="visualRunwareAttempts" type="number" min="1" max="5" step="1" placeholder="cfg" style="width:72px;" />
-          <label class="muted">attach p</label>
-          <input id="visualAttachProbability" type="number" min="0" max="1" step="0.05" placeholder="auto" style="width:90px;" />
-          <button onclick="saveVisualConfig()">Apply Visual</button>
-          <label class="muted">history</label>
-          <select id="visualLimit">
-            <option value="5">5</option>
-            <option value="10">10</option>
-            <option value="20" selected>20</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-          <button onclick="refreshVisualStatus(); refreshVisualWhy();">Refresh Visual</button>
-        </div>
-        <div class="row">
-          <input id="visualTestPrompt" type="text" placeholder="test prompt (optional)" style="min-width:280px;" />
-          <select id="visualTestMode">
-            <option value="auto" selected>auto test</option>
-            <option value="url">force url</option>
-            <option value="ascii">force ascii</option>
-            <option value="audio">force audio</option>
-            <option value="video">force video</option>
-          </select>
-          <button onclick="testVisual()">Test Visual</button>
-          <button onclick="testAudio()">Test Audio</button>
-          <button onclick="testVideo()">Test Video</button>
-        </div>
-        <div id="visualSummary" class="kv"></div>
-        <div id="visualResult" class="mono muted">No visual test yet.</div>
-        <details>
-          <summary>Raw JSON</summary>
-          <div id="visualStatus" class="mono">loading...</div>
-        </details>
-      </div>
-
-      <div class="card tab-card" data-tab="content">
-        <h2>Why This Visual</h2>
-        <div class="row">
-          <label class="muted">limit</label>
-          <select id="visualWhyLimit">
-            <option value="5">5</option>
-            <option value="10">10</option>
-            <option value="20" selected>20</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-          <button onclick="refreshVisualWhy()">Refresh Why</button>
-        </div>
-        <div id="visualWhy" class="mono">loading...</div>
-      </div>
-
-      <div class="card tab-card" data-tab="nft">
-        <h2>NFT / objkt</h2>
-        <div class="row">
-          <label class="muted"><input id="nftEnabled" type="checkbox" /> enabled</label>
-          <label class="muted">mode</label>
-          <select id="nftMode">
-            <option value="off">off</option>
-            <option value="draft" selected>draft</option>
-            <option value="manual">manual</option>
-            <option value="auto">auto</option>
-          </select>
-          <label class="muted"><input id="nftAutoDraft" type="checkbox" checked /> auto draft</label>
-          <button onclick="saveNftConfig()">Apply NFT</button>
-          <label class="muted">limit</label>
-          <select id="nftLimit">
-            <option value="5">5</option>
-            <option value="10">10</option>
-            <option value="20" selected>20</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-          <button onclick="refreshNftStatus()">Refresh NFT</button>
-        </div>
-        <div class="row">
-          <input id="nftPostRef" type="text" placeholder="post_id or moltbook_id (empty = latest visual post)" style="min-width:360px;" />
-          <button onclick="createNftDraft()">Create Draft</button>
-        </div>
-        <div class="row">
-          <input id="nftDraftId" type="text" placeholder="draft_id to mint" style="min-width:320px;" />
-          <input id="nftMintConfirm" type="text" placeholder="type MINT" style="max-width:140px;" />
-          <button onclick="mintNftDraft()">Mint Draft</button>
-        </div>
-        <div id="nftSummary" class="kv"></div>
-        <div id="nftResult" class="mono muted">No NFT action yet.</div>
-        <details>
-          <summary>Raw JSON</summary>
-          <div id="nftStatus" class="mono">loading...</div>
-        </details>
-      </div>
-
-      <div class="card tab-card" data-tab="operations">
-        <h2>Control</h2>
-        <div class="row">
-          <button onclick="setPause(true)">Pause Actions</button>
-          <button onclick="setPause(false)">Resume Actions</button>
-          <button onclick="thinkNow()">Think Now</button>
-        </div>
-        <div class="row">
-          <label class="muted"><input id="moltbookWritesEnabled" type="checkbox" checked /> Moltbook writes</label>
-          <button onclick="saveMoltbookConfig()">Apply Moltbook</button>
-          <span class="muted">When off: simulate actions locally (no Moltbook API writes).</span>
-        </div>
-        <div class="row">
-          <button onclick="runOnce(true)">Run Once (Dry)</button>
-          <button onclick="runOnce(false)">Run Once (Live)</button>
-          <button onclick="reloadFramework()">Reload Framework</button>
-        </div>
-        <div class="row">
-          <label class="muted">Thinker</label>
-          <select id="thinkerMode">
-            <option value="queue" selected>queue</option>
-            <option value="interval">interval</option>
-          </select>
-          <label class="muted"><input id="thinkerEnabled" type="checkbox" /> enabled</label>
-          <label class="muted"><input id="thinkerAutoQueue" type="checkbox" checked /> auto queue</label>
-          <button onclick="saveThinkerConfig()">Apply Thinker</button>
-        </div>
-        <div class="row">
-          <input id="deletePostId" type="text" placeholder="post_id to delete" style="min-width:320px;" />
-          <input id="deleteConfirm" type="text" placeholder="type DELETE" style="max-width:140px;" />
-          <button onclick="deletePost()">Delete Post</button>
-        </div>
-        <div id="controlResult" class="mono muted">No control action yet.</div>
-      </div>
-
-      <div class="card tab-card" data-tab="operations">
-        <h2>Ask Mu</h2>
-        <div class="row">
-          <select id="mode">
-            <option value="observe">observe (no influence)</option>
-            <option value="influence">influence (next heartbeat)</option>
-          </select>
-        </div>
-        <textarea id="question" placeholder="Your question..."></textarea>
-        <textarea id="instruction" placeholder="Influence instruction (optional, for influence mode)"></textarea>
-        <div class="row">
-          <button onclick="sendChat()">Send</button>
-          <span class="muted">Observe does not affect decisions. Influence queues one command.</span>
-        </div>
-        <div id="reply" class="mono"></div>
-      </div>
-      <div class="card tab-card" data-tab="dashboard">
-        <h2>Recent Activity</h2>
-        <div class="row">
-          <label class="muted">limit</label>
-          <select id="activityLimit">
-            <option value="5">5</option>
-            <option value="10" selected>10</option>
-            <option value="20">20</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-          <button onclick="refreshActivity()">Apply</button>
-        </div>
-        <div id="activity" class="mono">loading...</div>
-      </div>
-
-      <div class="card tab-card" data-tab="dashboard">
-        <h2>Live Timeline</h2>
-        <div class="row">
-          <label class="muted">limit</label>
-          <select id="timelineLimit">
-            <option value="5">5</option>
-            <option value="10" selected>10</option>
-            <option value="20">20</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-          <button onclick="refreshTimeline()">Apply</button>
-        </div>
-        <div id="timeline" class="mono">loading...</div>
-      </div>
-
-      <div class="card tab-card" data-tab="operations">
-        <h2>Reasoning Trace</h2>
-        <div class="row">
-          <label class="muted">limit</label>
-          <select id="reasoningLimit">
-            <option value="5">5</option>
-            <option value="10" selected>10</option>
-            <option value="20">20</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-          <select id="reasoningSource">
-            <option value="">all sources</option>
-            <option value="heartbeat">heartbeat</option>
-            <option value="conscious_worker">conscious_worker</option>
-          </select>
-          <input id="reasoningAction" type="text" placeholder="action_type filter" />
-          <button onclick="refreshReasoning()">Apply</button>
-        </div>
-        <div id="reasoning" class="mono">loading...</div>
-      </div>
-
-      <div class="card tab-card" data-tab="dashboard">
-        <h2>Safety Blocks</h2>
-        <div class="row">
-          <label class="muted">limit</label>
-          <select id="safetyLimit">
-            <option value="5">5</option>
-            <option value="10" selected>10</option>
-            <option value="20">20</option>
-            <option value="50">50</option>
-            <option value="100">100</option>
-          </select>
-          <button onclick="refreshSafety()">Refresh Safety</button>
-        </div>
-        <div id="safety" class="mono">loading...</div>
-      </div>
-
-      <div class="card tab-card" data-tab="content">
-        <h2>Logs</h2>
-        <div class="row">
-          <label class="muted">lines</label>
-          <select id="logsLimit">
-            <option value="50">50</option>
-            <option value="100" selected>100</option>
-            <option value="200">200</option>
-            <option value="500">500</option>
-            <option value="1000">1000</option>
-          </select>
-          <button onclick="refreshLogs()">Refresh Logs</button>
-        </div>
-        <div id="logs" class="mono">loading...</div>
-      </div>
-
-      <div class="card tab-card" data-tab="system">
-        <h2>Debug</h2>
-        <div id="debugSummary" class="kv"></div>
-        <details>
-          <summary>Raw JSON</summary>
-          <div id="debug" class="mono">loading...</div>
-        </details>
-      </div>
-    </div>
-  </div>
-  <script>
-    const token = () => document.getElementById('token').value.trim();
-    const withToken = (path) => {
-      const t = token();
-      if (!t) return path;
-      const sep = path.includes('?') ? '&' : '?';
-      return path + sep + 'token=' + encodeURIComponent(t);
-    };
-    const conscious = () => document.getElementById('conscious').checked;
-    const currentTabKey = 'mu_admin_tab_v2';
-
-    function showTab(tab) {
-      const allowed = new Set(['dashboard', 'operations', 'content', 'nft', 'system']);
-      if (!allowed.has(tab)) tab = 'dashboard';
-      const cards = document.querySelectorAll('.tab-card');
-      cards.forEach((card) => {
-        const cardTab = card.getAttribute('data-tab') || 'dashboard';
-        card.style.display = (cardTab === tab) ? 'block' : 'none';
-      });
-      document.querySelectorAll('.tab-btn').forEach((btn) => btn.classList.remove('active'));
-      const active = document.getElementById('tab-' + tab);
-      if (active) active.classList.add('active');
-      try { localStorage.setItem(currentTabKey, tab); } catch (_) {}
+    return {
+        "ok": True,
+        "control_flags": ctx.get_control_flags(),
+        "visual_status": ctx.fetch_visual_status(limit=10),
     }
 
-    function escapeHtml(value) {
-      return String(value)
-        .replaceAll('&', '&amp;')
-        .replaceAll('<', '&lt;')
-        .replaceAll('>', '&gt;')
-        .replaceAll('"', '&quot;')
-        .replaceAll("'", '&#39;');
+
+@app.post("/api/visual/test")
+def api_visual_test(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    prompt = str(body.get("prompt", "")).strip()
+    mode = str(body.get("mode", "auto")).strip().lower()
+    video_provider = str(body.get("video_provider", "")).strip().lower()
+    phase = str(body.get("phase", "emergence")).strip().lower() or "emergence"
+    try:
+        day = int(body.get("day", 1))
+    except (TypeError, ValueError):
+        day = 1
+    if mode not in {"auto", "url", "ascii", "audio", "video"}:
+        raise HTTPException(400, "invalid_mode")
+    if video_provider and video_provider not in {"pollinations", "fal"}:
+        raise HTTPException(400, "invalid_video_provider")
+    return ctx.test_visual_generation(
+        prompt=prompt or "mu glitch consciousness",
+        mode=mode,
+        phase=phase,
+        day=max(1, day),
+        video_provider=video_provider,
+    )
+
+
+@app.post("/api/control/nft")
+def api_control_nft(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    enabled = _to_bool(body.get("enabled", False), default=False)
+    mode = str(body.get("mode", "draft")).strip().lower()
+    auto_draft = _to_bool(body.get("auto_draft", True), default=True)
+    if mode not in {"off", "draft", "manual", "auto"}:
+        raise HTTPException(400, "invalid_mode")
+    ctx.set_control_flag("nft_enabled", "1" if enabled else "0")
+    ctx.set_control_flag("nft_mode", mode)
+    ctx.set_control_flag("nft_auto_draft", "1" if auto_draft else "0")
+    return {
+        "ok": True,
+        "control_flags": ctx.get_control_flags(),
+        "nft_status": ctx.fetch_nft_status(limit=10),
     }
 
-    function setKv(targetId, items) {
-      const el = document.getElementById(targetId);
-      if (!el) return;
-      const rows = [];
-      for (const [k, v] of items) {
-        rows.push('<b>' + escapeHtml(k) + '</b><span>' + escapeHtml(v) + '</span>');
-      }
-      el.innerHTML = rows.join('');
-    }
 
-    async function parseResponse(r) {
-      const text = await r.text();
-      let data = {};
-      try { data = text ? JSON.parse(text) : {}; } catch (_) { data = {raw: text}; }
-      if (!r.ok) {
-        const msg = data.error ? data.error : text;
-        throw new Error(msg || ('HTTP ' + r.status));
-      }
-      return data;
-    }
+@app.post("/api/nft/draft")
+def api_nft_draft(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    post_ref = str(body.get("post_id", "")).strip()
+    try:
+        return ctx.create_nft_draft_from_post(post_ref=post_ref)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"draft_failed: {exc}")
 
-    async function apiGet(path) {
-      const r = await fetch(withToken(path));
-      return await parseResponse(r);
-    }
-    async function apiPost(path, payload) {
-      const r = await fetch(withToken(path), {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(payload || {}),
-      });
-      return await parseResponse(r);
-    }
-    function updatePauseBadge(paused) {
-      const el = document.getElementById('pauseState');
-      if (paused) {
-        el.textContent = 'pause: ON';
-        el.className = 'pill warn';
-      } else {
-        el.textContent = 'pause: OFF';
-        el.className = 'pill ok';
-      }
-    }
-    function updateRunwareBadge(runtime) {
-      const el = document.getElementById('runwareState');
-      const state = String((runtime || {}).state || 'unknown');
-      const message = String((runtime || {}).message || '');
-      if (state === 'ok') {
-        el.textContent = 'runware: OK';
-        el.className = 'pill ok';
-      } else if (state === 'fallback' || state === 'mixed') {
-        el.textContent = 'runware: fallback';
-        el.className = 'pill warn';
-      } else if (state === 'no_key') {
-        el.textContent = 'runware: no key';
-        el.className = 'pill err';
-      } else {
-        el.textContent = 'runware: unknown';
-        el.className = 'pill muted';
-      }
-      if (message) {
-        el.title = message;
-      }
-    }
-    function updateNftBadge(statusPayload) {
-      const el = document.getElementById('nftState');
-      const effective = (statusPayload || {}).effective || {};
-      const objkt = (statusPayload || {}).objkt || {};
-      const enabled = !!effective.enabled;
-      const mode = String(effective.mode || 'off');
-      const webhookConfigured = !!objkt.webhook_configured;
-      if (!enabled || mode === 'off') {
-        el.textContent = 'nft: OFF';
-        el.className = 'pill muted';
-        return;
-      }
-      if (!webhookConfigured && (mode === 'manual' || mode === 'auto')) {
-        el.textContent = 'nft: no webhook';
-        el.className = 'pill err';
-        return;
-      }
-      if (mode === 'auto') {
-        el.textContent = 'nft: AUTO';
-        el.className = 'pill warn';
-        return;
-      }
-      if (mode === 'manual') {
-        el.textContent = 'nft: MANUAL';
-        el.className = 'pill ok';
-        return;
-      }
-      el.textContent = 'nft: DRAFT';
-      el.className = 'pill ok';
-    }
-    async function refreshStatus() {
-      const d = await apiGet('/api/status');
-      document.getElementById('status').textContent = JSON.stringify(d, null, 2);
-      document.getElementById('postActivity').textContent = JSON.stringify(d.post_activity || {}, null, 2);
-      const s = d.state || {};
-      const c = d.counts || {};
-      setKv('statusSummary', [
-        ['agent', String(s.agent_name || 'Mu')],
-        ['day / phase', String((s.current_day || '?') + ' / ' + (s.current_phase || '?'))],
-        ['last heartbeat', String(s.last_heartbeat || '-')],
-        ['posts today', String(s.posts_today || 0)],
-        ['comments today', String(s.comments_today || 0)],
-        ['pending operator', String(c.pending_operator || 0)],
-        ['reasoning traces', String(c.reasoning_traces || 0)],
-        ['pause actions', String(!!c.pause_actions)],
-      ]);
-      const pa = d.post_activity || {};
-      setKv('postActivitySummary', [
-        ['posts (10h)', String(pa.posts_last_10h || 0)],
-        ['posts (24h)', String(pa.posts_last_24h || 0)],
-        ['last post at', String(pa.last_post_at || '-')],
-        ['last title', String(pa.last_post_title || '-')],
-        ['last submolt', String(pa.last_post_submolt || '-')],
-      ]);
-      const flags = d.control_flags || {};
-      const paused = ['1', 'true', 'yes', 'on'].includes(String(flags.pause_actions || '').toLowerCase()) || !!(d.counts && d.counts.pause_actions);
-      updatePauseBadge(paused);
-      const writesEnabled = !['0', 'false', 'no', 'off'].includes(String(flags.moltbook_write_enabled || '1').toLowerCase());
-      const mw = document.getElementById('moltbookWritesEnabled');
-      if (mw) mw.checked = writesEnabled;
-      const thinkerEnabled = ['1', 'true', 'yes', 'on'].includes(String(flags.thinker_enabled || '').toLowerCase());
-      const thinkerAutoQueue = !['0', 'false', 'no', 'off'].includes(String(flags.thinker_auto_queue || '1').toLowerCase());
-      document.getElementById('thinkerEnabled').checked = thinkerEnabled;
-      document.getElementById('thinkerAutoQueue').checked = thinkerAutoQueue;
-      document.getElementById('thinkerMode').value = String(flags.thinker_mode || 'queue');
-      const nftEnabled = ['1', 'true', 'yes', 'on'].includes(String(flags.nft_enabled || '').toLowerCase());
-      const nftAutoDraft = !['0', 'false', 'no', 'off'].includes(String(flags.nft_auto_draft || '1').toLowerCase());
-      document.getElementById('nftEnabled').checked = nftEnabled;
-      document.getElementById('nftAutoDraft').checked = nftAutoDraft;
-      document.getElementById('nftMode').value = String(flags.nft_mode || 'draft');
-    }
-    async function refreshActivity() {
-      const limit = Number(document.getElementById('activityLimit').value || 10);
-      const d = await apiGet('/api/activity?limit=' + encodeURIComponent(String(limit)));
-      document.getElementById('activity').textContent = JSON.stringify(d, null, 2);
-    }
-    async function refreshVisualStatus() {
-      const limit = Number(document.getElementById('visualLimit').value || 20);
-      const d = await apiGet('/api/visual/status?limit=' + encodeURIComponent(String(limit)));
-      document.getElementById('visualStatus').textContent = JSON.stringify(d, null, 2);
-      const effective = d.effective || {};
-      const runtime = d.runware_runtime || {};
-      setKv('visualSummary', [
-        ['enabled', String(!!effective.enabled)],
-        ['mode', String(effective.mode || 'auto')],
-        ['provider', String(effective.url_provider || 'pollinations')],
-        ['fallback', String(effective.fallback_provider || ((d.providers || {}).fallback_provider || 'pollinations'))],
-        ['pollinations key', String(!!((d.providers || {}).pollinations_key_present))],
-        ['video provider', String(((d.providers || {}).video_provider || 'pollinations'))],
-        ['fal key', String(!!((d.providers || {}).fal_key_present))],
-        ['runware tries', String(
-          (effective.runware_max_attempts_override !== null && effective.runware_max_attempts_override !== undefined)
-            ? effective.runware_max_attempts_override
-            : ((d.providers || {}).runware_max_attempts || 1)
-        )],
-        ['runware state', String(runtime.state || 'unknown')],
-        ['runware msg', String(runtime.message || '-')],
-        ['recent visual posts', String((d.recent_visual_posts || []).length)],
-      ]);
-      document.getElementById('visualEnabled').checked = !!effective.enabled;
-      document.getElementById('visualMode').value = String(effective.mode || 'auto');
-      document.getElementById('visualProvider').value = String(effective.url_provider || 'pollinations');
-      const vvp = String(effective.video_provider || ((d.providers || {}).video_provider || 'pollinations'));
-      const vvpEl = document.getElementById('visualVideoProvider');
-      if (vvpEl) vvpEl.value = vvp;
-      document.getElementById('visualFallbackProvider').value = String(
-        effective.fallback_provider || ((d.providers || {}).fallback_provider || 'pollinations')
-      );
-      const runwareAttempts = effective.runware_max_attempts_override;
-      document.getElementById('visualRunwareAttempts').value =
-        (runwareAttempts === null || runwareAttempts === undefined) ? '' : String(runwareAttempts);
-      const p = effective.attach_probability_override;
-      document.getElementById('visualAttachProbability').value = (p === null || p === undefined) ? '' : String(p);
-      updateRunwareBadge(runtime);
-    }
-    async function refreshVisualWhy() {
-      const limit = Number(document.getElementById('visualWhyLimit').value || 20);
-      const d = await apiGet('/api/visual/why?limit=' + encodeURIComponent(String(limit)));
-      document.getElementById('visualWhy').textContent = JSON.stringify(d, null, 2);
-    }
-    async function refreshNftStatus() {
-      const limit = Number(document.getElementById('nftLimit').value || 20);
-      const d = await apiGet('/api/nft/status?limit=' + encodeURIComponent(String(limit)));
-      document.getElementById('nftStatus').textContent = JSON.stringify(d, null, 2);
-      const effective = d.effective || {};
-      const objkt = d.objkt || {};
-      const counts = d.counts || {};
-      setKv('nftSummary', [
-        ['enabled', String(!!effective.enabled)],
-        ['mode', String(effective.mode || 'draft')],
-        ['auto draft', String(!!effective.auto_draft)],
-        ['webhook configured', String(!!objkt.webhook_configured)],
-        ['token present', String(!!objkt.token_present)],
-        ['draft/minting/minted/sim/failed', String((counts.draft || 0) + '/' + (counts.minting || 0) + '/' + (counts.minted || 0) + '/' + (counts.simulated || 0) + '/' + (counts.failed || 0))],
-      ]);
-      document.getElementById('nftEnabled').checked = !!effective.enabled;
-      document.getElementById('nftMode').value = String(effective.mode || 'draft');
-      document.getElementById('nftAutoDraft').checked = !!effective.auto_draft;
-      updateNftBadge(d);
-    }
-    async function refreshLogs() {
-      const lines = Number(document.getElementById('logsLimit').value || 100);
-      const d = await apiGet('/api/logs?lines=' + encodeURIComponent(String(lines)));
-      document.getElementById('logs').textContent = (d.lines || []).join('\\n');
-    }
-    async function refreshReasoning() {
-      const limit = Number(document.getElementById('reasoningLimit').value || 10);
-      const source = document.getElementById('reasoningSource').value;
-      const actionType = document.getElementById('reasoningAction').value.trim();
-      let path = '/api/reasoning?limit=' + encodeURIComponent(String(limit));
-      if (source) path += '&source=' + encodeURIComponent(source);
-      if (actionType) path += '&action_type=' + encodeURIComponent(actionType);
-      const d = await apiGet(path);
-      document.getElementById('reasoning').textContent = JSON.stringify(d, null, 2);
-    }
-    async function refreshSafety() {
-      const limit = Number(document.getElementById('safetyLimit').value || 10);
-      const d = await apiGet('/api/safety?limit=' + encodeURIComponent(String(limit)));
-      document.getElementById('safety').textContent = JSON.stringify(d, null, 2);
-    }
-    async function refreshTimeline() {
-      const limit = Number(document.getElementById('timelineLimit').value || 10);
-      const d = await apiGet('/api/timeline?limit=' + encodeURIComponent(String(limit)));
-      document.getElementById('timeline').textContent = JSON.stringify(d, null, 2);
-    }
-    async function refreshDebug() {
-      const d = await apiGet('/api/debug/runtime');
-      document.getElementById('debug').textContent = JSON.stringify(d, null, 2);
-      const services = Array.isArray(d.services) ? d.services : [];
-      const active = services.filter((s) => String(s.active || '') === 'active').length;
-      setKv('debugSummary', [
-        ['server time', String(d.server_time || '-')],
-        ['uptime (sec)', String(d.uptime_seconds || 0)],
-        ['project root', String(d.project_root || '-')],
-        ['services active', String(active + '/' + services.length)],
-        ['framework available', String(!!((d.framework || {}).available))],
-      ]);
-    }
-    async function sendChat() {
-      const mode = document.getElementById('mode').value;
-      const question = document.getElementById('question').value;
-      const instruction = document.getElementById('instruction').value;
-      const d = await apiPost('/api/chat', {mode, question, instruction, conscious: conscious()});
-      document.getElementById('reply').textContent = JSON.stringify(d, null, 2);
-      await refreshAll();
-    }
-    async function thinkNow() {
-      const d = await apiPost('/api/conscious/think', {conscious: conscious()});
-      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
-      await refreshAll();
-    }
-    async function setPause(paused) {
-      const d = await apiPost('/api/control/pause', {paused});
-      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
-      updatePauseBadge(!!paused);
-      await refreshAll();
-    }
-    async function saveMoltbookConfig() {
-      const writesEnabled = document.getElementById('moltbookWritesEnabled').checked;
-      const d = await apiPost('/api/control/moltbook', {writes_enabled: writesEnabled});
-      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
-      await refreshAll();
-    }
-    async function reloadFramework() {
-      const d = await apiPost('/api/control/reload_framework', {});
-      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
-      await refreshAll();
-    }
-    async function saveThinkerConfig() {
-      const enabled = document.getElementById('thinkerEnabled').checked;
-      const autoQueue = document.getElementById('thinkerAutoQueue').checked;
-      const mode = document.getElementById('thinkerMode').value;
-      const d = await apiPost('/api/control/thinker', {enabled, auto_queue: autoQueue, mode});
-      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
-      await refreshAll();
-    }
-    async function saveVisualConfig() {
-      const enabled = document.getElementById('visualEnabled').checked;
-      const mode = document.getElementById('visualMode').value;
-      const urlProvider = document.getElementById('visualProvider').value;
-      const videoProvider = document.getElementById('visualVideoProvider').value;
-      const fallbackProvider = document.getElementById('visualFallbackProvider').value;
-      const runwareAttempts = document.getElementById('visualRunwareAttempts').value.trim();
-      const attachProbability = document.getElementById('visualAttachProbability').value.trim();
-      const payload = {
-        enabled,
-        mode,
-        url_provider: urlProvider,
-        video_provider: videoProvider,
-        fallback_provider: fallbackProvider,
-        runware_max_attempts: runwareAttempts,
-        attach_probability: attachProbability,
-      };
-      const d = await apiPost('/api/control/visual', payload);
-      document.getElementById('visualResult').textContent = JSON.stringify(d, null, 2);
-      await refreshAll();
-    }
-    async function runVisualTest(modeOverride='') {
-      const prompt = document.getElementById('visualTestPrompt').value.trim();
-      const mode = modeOverride || document.getElementById('visualTestMode').value;
-      const videoProvider = (document.getElementById('visualVideoProvider') || {}).value || '';
-      const status = await apiGet('/api/status');
-      const state = status.state || {};
-      const payload = {
-        prompt: prompt || 'mu glitch void mirror',
-        mode,
-        video_provider: String(videoProvider || ''),
-        phase: String(state.current_phase || 'emergence'),
-        day: Number(state.current_day || 1),
-      };
-      const d = await apiPost('/api/visual/test', payload);
-      document.getElementById('visualResult').textContent = JSON.stringify(d, null, 2);
-      await refreshVisualStatus();
-      await refreshVisualWhy();
-    }
-    async function testVisual() { await runVisualTest(''); }
-    async function testAudio() { await runVisualTest('audio'); }
-    async function testVideo() { await runVisualTest('video'); }
-    async function saveNftConfig() {
-      const enabled = document.getElementById('nftEnabled').checked;
-      const mode = document.getElementById('nftMode').value;
-      const autoDraft = document.getElementById('nftAutoDraft').checked;
-      const d = await apiPost('/api/control/nft', {enabled, mode, auto_draft: autoDraft});
-      document.getElementById('nftResult').textContent = JSON.stringify(d, null, 2);
-      await refreshNftStatus();
-      await refreshStatus();
-    }
-    async function createNftDraft() {
-      const postRef = document.getElementById('nftPostRef').value.trim();
-      const d = await apiPost('/api/nft/draft', {post_id: postRef});
-      document.getElementById('nftResult').textContent = JSON.stringify(d, null, 2);
-      const draftId = (((d || {}).draft || {}).id || '');
-      if (draftId) document.getElementById('nftDraftId').value = draftId;
-      await refreshNftStatus();
-    }
-    async function mintNftDraft() {
-      const draftId = document.getElementById('nftDraftId').value.trim();
-      const confirmText = document.getElementById('nftMintConfirm').value.trim().toUpperCase();
-      if (!draftId) {
-        alert('draft_id required');
-        return;
-      }
-      if (confirmText !== 'MINT') {
-        alert('Type MINT in confirmation field');
-        return;
-      }
-      const ok = confirm('Mint draft ' + draftId + '? This will trigger external mint webhook.');
-      if (!ok) return;
-      const d = await apiPost('/api/nft/mint', {draft_id: draftId, confirm_text: confirmText});
-      document.getElementById('nftResult').textContent = JSON.stringify(d, null, 2);
-      await refreshNftStatus();
-    }
-    async function runOnce(dryRun) {
-      if (!dryRun) {
-        const ok = confirm('Run live heartbeat now? It may publish/comment immediately.');
-        if (!ok) return;
-      }
-      const d = await apiPost('/api/control/run_once', {dry_run: dryRun, timeout_seconds: 300});
-      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
-      await refreshAll();
-    }
-    async function deletePost() {
-      const postId = document.getElementById('deletePostId').value.trim();
-      const confirmText = document.getElementById('deleteConfirm').value.trim();
-      if (!postId) {
-        alert('post_id required');
-        return;
-      }
-      if (confirmText.toUpperCase() !== 'DELETE') {
-        alert('Type DELETE in confirmation field');
-        return;
-      }
-      const ok = confirm('Delete post ' + postId + '? This action cannot be undone.');
-      if (!ok) return;
-      const d = await apiPost('/api/control/delete_post', {post_id: postId, confirm_text: confirmText});
-      document.getElementById('controlResult').textContent = JSON.stringify(d, null, 2);
-      await refreshAll();
-    }
-    async function refreshAll() {
-      const h = document.getElementById('health');
-      try {
-        await Promise.all([refreshStatus(), refreshVisualStatus(), refreshVisualWhy(), refreshNftStatus(), refreshActivity(), refreshTimeline(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
-        h.textContent = 'OK';
-        h.className = 'pill ok';
-      } catch (e) {
-        h.textContent = 'ERROR: ' + e.message;
-        h.className = 'pill err';
-      }
-    }
-    const savedTab = (() => { try { return localStorage.getItem(currentTabKey) || 'dashboard'; } catch (_) { return 'dashboard'; } })();
-    showTab(savedTab);
-    refreshAll();
-    setInterval(refreshAll, 15000);
-  </script>
-</body>
-</html>
-"""
+
+@app.post("/api/nft/mint")
+def api_nft_mint(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    draft_id = str(body.get("draft_id", "")).strip()
+    confirm_text = str(body.get("confirm_text", "")).strip().upper()
+    if not draft_id:
+        raise HTTPException(400, "draft_id_required")
+    if confirm_text != "MINT":
+        raise HTTPException(400, "confirm_text_must_be_MINT")
+    try:
+        return ctx.mint_nft_draft(draft_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:
+        raise HTTPException(500, f"mint_failed: {exc}")
+
+
+@app.post("/api/control/run_once")
+def api_control_run_once(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    dry_run = _to_bool(body.get("dry_run", True), default=True)
+    timeout_seconds = int(body.get("timeout_seconds", 240))
+    try:
+        return ctx.run_once(dry_run=dry_run, timeout_seconds=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "run_once_timeout")
+    except Exception as exc:
+        raise HTTPException(500, f"run_once_failed: {exc}")
+
+
+@app.post("/api/control/delete_post")
+def api_control_delete_post(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    post_id = str(body.get("post_id", "")).strip()
+    confirm_text = str(body.get("confirm_text", "")).strip().upper()
+    if not post_id:
+        raise HTTPException(400, "post_id_required")
+    if confirm_text != "DELETE":
+        raise HTTPException(400, "confirm_text_must_be_DELETE")
+    try:
+        deleted = ctx.delete_post(post_id)
+    except Exception as exc:
+        raise HTTPException(500, f"delete_post_failed: {exc}")
+    return {"ok": True, "deleted": deleted}
+
+
+# ======================================================================
+# CLI Entry Point
+# ======================================================================
 
 
 @click.command()
-@click.option("--host", default="127.0.0.1", show_default=True)
-@click.option("--port", default=8787, type=int, show_default=True)
+@click.option("--host", default="0.0.0.0", show_default=True)
+@click.option("--port", default=8000, type=int, show_default=True)
 @click.option("--config-dir", default=None, type=click.Path(), help="Config directory")
 @click.option("--admin-token", default="", help="Require this token for /api/*")
 @click.option("--conscious-dir", default="", help="Path to conscious-claude framework directory")
 def main(host: str, port: int, config_dir: str | None, admin_token: str, conscious_dir: str) -> None:
+    global _ctx
+
     cfg = load_config(config_dir)
     root = Path(__file__).resolve().parent.parent
     storage = cfg.get("storage", {})
@@ -2668,7 +1849,7 @@ def main(host: str, port: int, config_dir: str | None, admin_token: str, conscio
     token = admin_token.strip() or cfg.get("_secrets", {}).get("admin_token", "") or ""
     fw_dir = Path(conscious_dir) if conscious_dir else (root / "NEW" / "conscious-claude-master")
 
-    AdminHandler.ctx = AdminContext(
+    _ctx = AdminContext(
         cfg=cfg,
         project_root=root,
         state_path=state_path,
@@ -2678,18 +1859,15 @@ def main(host: str, port: int, config_dir: str | None, admin_token: str, conscio
         framework_dir=fw_dir,
     )
 
-    server = ThreadingHTTPServer((host, port), AdminHandler)
-    click.echo(f"Mu admin UI listening on http://{host}:{port}")
+    click.echo(f"Mu admin API (FastAPI) listening on http://{host}:{port}")
+    click.echo(f"CORS enabled for all origins")
     if token:
         click.echo("Admin token enabled (token query param or X-Admin-Token header).")
     click.echo(f"Conscious framework dir: {fw_dir}")
-    click.echo(f"Conscious framework available: {AdminHandler.ctx.framework.available}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
+    click.echo(f"Conscious framework available: {_ctx.framework.available}")
+
+    import uvicorn
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
