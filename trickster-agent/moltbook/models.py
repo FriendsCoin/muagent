@@ -87,6 +87,14 @@ class Post(MoltBaseModel):
             return ""
         return str(v) if v is not None else ""
 
+    @field_validator("url", mode="before")
+    @classmethod
+    def coerce_url(cls, v: Any) -> str:
+        # Moltbook sometimes returns null for url. Treat as empty string.
+        if v is None:
+            return ""
+        return str(v)
+
     @field_validator("id", mode="before")
     @classmethod
     def extract_id_fallback(cls, v: Any, info: ValidationInfo) -> str:

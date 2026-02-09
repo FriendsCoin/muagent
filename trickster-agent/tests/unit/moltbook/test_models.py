@@ -69,6 +69,11 @@ class TestPost:
         post = Post.from_api({"url": "https://www.moltbook.com/posts/abc-123", "title": "t"})
         assert post.id == "abc-123"
 
+    def test_from_api_null_url_is_ok(self):
+        post = Post.from_api({"id": "p", "url": None})
+        assert post.id == "p"
+        assert post.url == ""
+
 
 class TestAgent:
     def test_from_api(self):
