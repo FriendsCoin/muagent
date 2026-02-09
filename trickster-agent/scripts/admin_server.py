@@ -822,6 +822,34 @@ class AdminContext:
             runware_max_attempts_override=effective.get("runware_max_attempts_override"),
         )
 
+        # Pollinations video is not always available. If the generated URL 404s,
+        # fall back to a standard image URL so the pipeline still works.
+        if base_force == "video" and base_visual.url.startswith("http"):
+            try:
+                import httpx
+
+                resp = httpx.head(base_visual.url, timeout=8, follow_redirects=True)
+                if resp.status_code >= 400:
+                    base_visual = generator.generate(
+                        theme=prompt[:80] or "mystery",
+                        mood="soft_ominous",
+                        phase=phase or "emergence",
+                        day=max(1, int(day)),
+                        context=prompt,
+                        force_mode="url",
+                        enabled_override=effective["enabled"],
+                        attach_probability_override=1.0,
+                        url_provider_override=str(effective["url_provider"] or ""),
+                        fallback_provider_override=str(effective.get("fallback_provider") or ""),
+                        runware_max_attempts_override=effective.get("runware_max_attempts_override"),
+                    )
+                    base_visual.meta = dict(base_visual.meta or {})
+                    base_visual.meta["video_fallback_used"] = True
+                    base_visual.meta["video_error_reason"] = f"http_{resp.status_code}"
+            except Exception:
+                # Best-effort only; keep original base_visual if probing fails.
+                pass
+
         image_bytes: bytes | None = None
         image_media_type = "image/jpeg"
         if base_force == "url" and base_visual.url.startswith("http"):

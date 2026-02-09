@@ -400,6 +400,32 @@ class MuAgent:
                 runware_max_attempts_override=visual_runware_attempts_override,
             )
 
+            # Pollinations video is not always available. If video URL errors, fall back to image.
+            if base_force == "video" and base_visual.url.startswith("http"):
+                try:
+                    import httpx
+
+                    resp = httpx.head(base_visual.url, timeout=8, follow_redirects=True)
+                    if resp.status_code >= 400:
+                        base_visual = self._visual.generate(
+                            theme=action.theme,
+                            mood=action.visual_mood,
+                            phase=state.current_phase,
+                            day=state.current_day,
+                            context=visual_context,
+                            force_mode="url",
+                            enabled_override=visual_enabled_override,
+                            attach_probability_override=1.0,
+                            url_provider_override=visual_provider_flag,
+                            fallback_provider_override=visual_fallback_provider_flag,
+                            runware_max_attempts_override=visual_runware_attempts_override,
+                        )
+                        base_visual.meta = dict(base_visual.meta or {})
+                        base_visual.meta["video_fallback_used"] = True
+                        base_visual.meta["video_error_reason"] = f"http_{resp.status_code}"
+                except Exception:
+                    pass
+
             image_bytes: bytes | None = None
             image_media_type = "image/jpeg"
             if base_force == "url" and base_visual.url.startswith("http"):
