@@ -346,7 +346,20 @@ class VisualGenerator:
             return None, "no_key", "POLLINATIONS_API_KEY missing"
 
         base = str(self._url_cfg.get("pollinations_enter_endpoint", "https://gen.pollinations.ai/openai")).strip()
-        endpoint = base.rstrip("/") + "/images/generations"
+        base = base.rstrip("/")
+        endpoint_candidates: list[str] = []
+        # Accept multiple base styles:
+        # - https://gen.pollinations.ai/openai
+        # - https://gen.pollinations.ai/openai/v1
+        # - https://gen.pollinations.ai
+        if base.endswith("/v1"):
+            endpoint_candidates.append(base + "/images/generations")
+        elif base.endswith("/openai"):
+            endpoint_candidates.append(base + "/v1/images/generations")
+            endpoint_candidates.append(base + "/images/generations")
+        else:
+            endpoint_candidates.append(base + "/openai/v1/images/generations")
+            endpoint_candidates.append(base + "/openai/images/generations")
         model = str(self._url_cfg.get("model", "flux")).strip() or "flux"
         timeout_seconds = float(self._url_cfg.get("timeout_seconds", 25))
 
@@ -361,44 +374,62 @@ class VisualGenerator:
             "Content-Type": "application/json",
         }
 
-        try:
-            response = httpx.post(endpoint, json=payload, headers=headers, timeout=timeout_seconds)
-            response.raise_for_status()
-            body = response.json()
-        except httpx.TimeoutException as exc:
-            return None, "timeout", str(exc)
-        except httpx.HTTPStatusError as exc:
-            status_code = exc.response.status_code if exc.response is not None else 0
-            raw = ""
-            if exc.response is not None:
-                raw = exc.response.text[:220]
-            reason = self._classify_pollinations_response(status_code, raw)
-            return None, reason, raw
-        except httpx.RequestError as exc:
-            return None, "network_error", str(exc)
-        except ValueError as exc:
-            return None, "invalid_json", str(exc)
-        except Exception:
-            return None, "unknown_error", ""
-
-        data = []
-        if isinstance(body, dict):
-            raw_data = body.get("data", [])
-            if isinstance(raw_data, list):
-                data = raw_data
-            elif isinstance(raw_data, dict):
-                data = [raw_data]
-        for item in data:
-            if not isinstance(item, dict):
+        last_reason = "unknown_error"
+        last_detail = ""
+        for endpoint in endpoint_candidates:
+            try:
+                response = httpx.post(endpoint, json=payload, headers=headers, timeout=timeout_seconds)
+                response.raise_for_status()
+                body = response.json()
+            except httpx.TimeoutException as exc:
+                last_reason = "timeout"
+                last_detail = str(exc)
                 continue
-            image_url = str(item.get("url", "") or item.get("image_url", "")).strip()
-            if image_url:
-                return (
-                    VisualAttachment(kind="url", provider="pollinations_enter", prompt=prompt, url=image_url),
-                    "",
-                    "",
-                )
-        return None, "empty_response", "Pollinations response had no image url"
+            except httpx.HTTPStatusError as exc:
+                status_code = exc.response.status_code if exc.response is not None else 0
+                raw = ""
+                if exc.response is not None:
+                    raw = exc.response.text[:220]
+                last_reason = self._classify_pollinations_response(status_code, raw)
+                last_detail = f"{endpoint} :: {raw}"
+                # Try next candidate for 404 path mismatch; stop early for auth/quota/rate.
+                if status_code in {401, 402, 403, 429}:
+                    return None, last_reason, last_detail
+                continue
+            except httpx.RequestError as exc:
+                last_reason = "network_error"
+                last_detail = str(exc)
+                continue
+            except ValueError as exc:
+                last_reason = "invalid_json"
+                last_detail = str(exc)
+                continue
+            except Exception:
+                last_reason = "unknown_error"
+                last_detail = ""
+                continue
+
+            data = []
+            if isinstance(body, dict):
+                raw_data = body.get("data", [])
+                if isinstance(raw_data, list):
+                    data = raw_data
+                elif isinstance(raw_data, dict):
+                    data = [raw_data]
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                image_url = str(item.get("url", "") or item.get("image_url", "")).strip()
+                if image_url:
+                    return (
+                        VisualAttachment(kind="url", provider="pollinations_enter", prompt=prompt, url=image_url),
+                        "",
+                        "",
+                    )
+            last_reason = "empty_response"
+            last_detail = f"{endpoint} :: Pollinations response had no image url"
+
+        return None, last_reason, last_detail
 
     def _generate_ascii(self, *, prompt: str, day: int) -> VisualAttachment:
         width = int(self._ascii_cfg.get("width", 42))
