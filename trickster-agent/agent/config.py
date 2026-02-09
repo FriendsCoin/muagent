@@ -34,6 +34,7 @@ def load_config(
         "moltbook_api_key": os.getenv("MOLTBOOK_API_KEY", ""),
         "anthropic_api_key": os.getenv("ANTHROPIC_API_KEY", ""),
         "runware_api_key": os.getenv("RUNWARE_API_KEY", ""),
+        "pollinations_api_key": os.getenv("POLLINATIONS_API_KEY", ""),
         "comfyui_api_key": os.getenv("COMFYUI_API_KEY", ""),
         "admin_token": os.getenv("ADMIN_TOKEN", ""),
         "objkt_webhook_token": os.getenv("OBJKT_WEBHOOK_TOKEN", ""),

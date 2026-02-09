@@ -118,8 +118,10 @@ visual_posting:
     ascii: 0.35
 
   url:
-    # provider: "pollinations" | "runware"
+    # provider: "pollinations" | "pollinations_enter" | "runware"
     provider: "pollinations"
+    # key-based endpoint (OpenAI-compatible image API on Enter)
+    pollinations_enter_endpoint: "https://gen.pollinations.ai/openai"
     # fallback when runware fails: "pollinations" | "ascii"
     fallback_provider: "pollinations"
     model: "flux"

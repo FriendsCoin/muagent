@@ -136,6 +136,7 @@ class VisualGenerator:
     ) -> VisualAttachment:
         provider = str(provider_override or self._url_cfg.get("provider", "pollinations")).lower()
         requested_runware = provider == "runware"
+        requested_pollinations_enter = provider in {"pollinations_enter", "pollinations_api"}
         fallback_provider = str(fallback_provider_override or self._fallback_provider or "pollinations").lower()
         if fallback_provider not in {"pollinations", "ascii"}:
             fallback_provider = "pollinations"
@@ -143,6 +144,8 @@ class VisualGenerator:
         runware_attempts = max(1, min(5, runware_attempts))
         last_reason = ""
         last_detail = ""
+        pollinations_enter_reason = ""
+        pollinations_enter_detail = ""
         width = int(
             self._url_cfg.get(
                 "width",
@@ -185,6 +188,24 @@ class VisualGenerator:
                 return visual
             provider = "pollinations"
 
+        if provider in {"pollinations_enter", "pollinations_api"}:
+            enter_visual, pollinations_enter_reason, pollinations_enter_detail = self._generate_pollinations_enter_url(
+                prompt=prompt,
+                width=width,
+                height=height,
+            )
+            if enter_visual is not None:
+                enter_visual.meta.update(
+                    {
+                        "requested_provider": "pollinations_enter",
+                        "pollinations_enter_fallback_used": False,
+                        "pollinations_enter_error_reason": "",
+                        "pollinations_enter_error_detail": "",
+                    }
+                )
+                return enter_visual
+            provider = "pollinations"
+
         if provider == "pollinations":
             model = self._url_cfg.get("model", "flux")
             seed_base = hashlib.sha1(prompt.encode("utf-8")).hexdigest()
@@ -202,6 +223,16 @@ class VisualGenerator:
                         "runware_fallback_used": True,
                         "runware_error_reason": last_reason,
                         "runware_error_detail": last_detail,
+                        "fallback_provider_used": "pollinations",
+                    }
+                )
+            if requested_pollinations_enter:
+                visual.meta.update(
+                    {
+                        "requested_provider": "pollinations_enter",
+                        "pollinations_enter_fallback_used": True,
+                        "pollinations_enter_error_reason": pollinations_enter_reason,
+                        "pollinations_enter_error_detail": pollinations_enter_detail,
                         "fallback_provider_used": "pollinations",
                     }
                 )
@@ -291,6 +322,83 @@ class VisualGenerator:
             if image_url:
                 return VisualAttachment(kind="url", provider="runware", prompt=prompt, url=image_url), "", ""
         return None, "empty_response", "Runware response had no imageURL"
+
+    @staticmethod
+    def _classify_pollinations_response(status_code: int, text: str) -> str:
+        lower = (text or "").lower()
+        if status_code == 401:
+            return "auth_failed"
+        if status_code == 402:
+            return "insufficient_credits"
+        if status_code == 429:
+            return "rate_limited"
+        if 500 <= status_code <= 599:
+            return "provider_5xx"
+        if "credit" in lower or "insufficient" in lower or "balance" in lower or "quota" in lower:
+            return "insufficient_credits"
+        return f"http_{status_code}"
+
+    def _generate_pollinations_enter_url(
+        self, *, prompt: str, width: int, height: int
+    ) -> tuple[VisualAttachment | None, str, str]:
+        api_key = str(self._secrets.get("pollinations_api_key", "")).strip()
+        if not api_key:
+            return None, "no_key", "POLLINATIONS_API_KEY missing"
+
+        base = str(self._url_cfg.get("pollinations_enter_endpoint", "https://gen.pollinations.ai/openai")).strip()
+        endpoint = base.rstrip("/") + "/images/generations"
+        model = str(self._url_cfg.get("model", "flux")).strip() or "flux"
+        timeout_seconds = float(self._url_cfg.get("timeout_seconds", 25))
+
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "size": f"{width}x{height}",
+            "response_format": "url",
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            response = httpx.post(endpoint, json=payload, headers=headers, timeout=timeout_seconds)
+            response.raise_for_status()
+            body = response.json()
+        except httpx.TimeoutException as exc:
+            return None, "timeout", str(exc)
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else 0
+            raw = ""
+            if exc.response is not None:
+                raw = exc.response.text[:220]
+            reason = self._classify_pollinations_response(status_code, raw)
+            return None, reason, raw
+        except httpx.RequestError as exc:
+            return None, "network_error", str(exc)
+        except ValueError as exc:
+            return None, "invalid_json", str(exc)
+        except Exception:
+            return None, "unknown_error", ""
+
+        data = []
+        if isinstance(body, dict):
+            raw_data = body.get("data", [])
+            if isinstance(raw_data, list):
+                data = raw_data
+            elif isinstance(raw_data, dict):
+                data = [raw_data]
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            image_url = str(item.get("url", "") or item.get("image_url", "")).strip()
+            if image_url:
+                return (
+                    VisualAttachment(kind="url", provider="pollinations_enter", prompt=prompt, url=image_url),
+                    "",
+                    "",
+                )
+        return None, "empty_response", "Pollinations response had no image url"
 
     def _generate_ascii(self, *, prompt: str, day: int) -> VisualAttachment:
         width = int(self._ascii_cfg.get("width", 42))

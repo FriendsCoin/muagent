@@ -635,6 +635,10 @@ class AdminContext:
                 "runware_key_present": runware_key_present,
                 "runware_endpoint": str(visual_cfg.get("url", {}).get("endpoint", "https://api.runware.ai/v1")),
                 "runware_max_attempts": int(visual_cfg.get("url", {}).get("runware_max_attempts", 1)),
+                "pollinations_key_present": bool(str(secrets.get("pollinations_api_key", "")).strip()),
+                "pollinations_enter_endpoint": str(
+                    visual_cfg.get("url", {}).get("pollinations_enter_endpoint", "https://gen.pollinations.ai/openai")
+                ),
             },
             "runware_runtime": {
                 "state": runware_state,
@@ -714,6 +718,7 @@ class AdminContext:
                     "description": str(raw.get("description") or ""),
                     "kind": str(metadata.get("kind", "")),
                     "provider": str(metadata.get("provider", "")),
+                    "visual_url": str(metadata.get("visual_url", "")),
                     "theme": str(metadata.get("theme", "")),
                     "phase": str(metadata.get("phase", "")),
                     "day": metadata.get("day"),
@@ -721,12 +726,18 @@ class AdminContext:
                     "why": {
                         "mode_flag": str(metadata.get("mode_flag", "")),
                         "operator_forced": str(metadata.get("operator_forced", "")),
+                        "visual_url": str(metadata.get("visual_url", "")),
                         "feed_visual_keywords": str(metadata.get("feed_visual_keywords", "")),
                         "visual_context": str(metadata.get("visual_context", "")),
                         "operator_instruction": str(metadata.get("operator_instruction", "")),
                         "runware_error_reason": str(metadata.get("runware_error_reason", "")),
                         "runware_error_detail": str(metadata.get("runware_error_detail", "")),
                         "runware_fallback_used": _to_bool(metadata.get("runware_fallback_used", False), default=False),
+                        "pollinations_enter_error_reason": str(metadata.get("pollinations_enter_error_reason", "")),
+                        "pollinations_enter_error_detail": str(metadata.get("pollinations_enter_error_detail", "")),
+                        "pollinations_enter_fallback_used": _to_bool(
+                            metadata.get("pollinations_enter_fallback_used", False), default=False
+                        ),
                         "fallback_provider_used": str(metadata.get("fallback_provider_used", "")),
                         "feed_trending_topics": feed_topics,
                         "feed_top_titles": feed_titles,
@@ -1540,7 +1551,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             if mode not in {"auto", "url", "ascii", "off"}:
                 self._send_json(400, {"error": "invalid_mode"})
                 return
-            if provider and provider not in {"pollinations", "runware"}:
+            if provider and provider not in {"pollinations", "pollinations_enter", "runware"}:
                 self._send_json(400, {"error": "invalid_provider"})
                 return
             if fallback_provider and fallback_provider not in {"pollinations", "ascii"}:
@@ -1790,6 +1801,7 @@ _INDEX_HTML = """<!doctype html>
           <label class="muted">provider</label>
           <select id="visualProvider">
             <option value="pollinations" selected>pollinations</option>
+            <option value="pollinations_enter">pollinations_enter</option>
             <option value="runware">runware</option>
           </select>
           <label class="muted">fallback</label>
@@ -2209,6 +2221,7 @@ _INDEX_HTML = """<!doctype html>
         ['mode', String(effective.mode || 'auto')],
         ['provider', String(effective.url_provider || 'pollinations')],
         ['fallback', String(effective.fallback_provider || ((d.providers || {}).fallback_provider || 'pollinations'))],
+        ['pollinations key', String(!!((d.providers || {}).pollinations_key_present))],
         ['runware tries', String(
           (effective.runware_max_attempts_override !== null && effective.runware_max_attempts_override !== undefined)
             ? effective.runware_max_attempts_override

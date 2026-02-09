@@ -89,3 +89,21 @@ def test_visual_generator_runware_without_key_falls_back():
     visual = gen.generate(theme="render", mood="soft_ominous", phase="emergence", day=2)
     assert visual.kind == "url"
     assert visual.provider in {"pollinations", "pollinations_fallback"}
+
+
+def test_visual_generator_pollinations_enter_without_key_falls_back_to_public_url():
+    cfg = {
+        "_secrets": {"pollinations_api_key": ""},
+        "visual_posting": {
+            "enabled": True,
+            "attach_probability": {"emergence": 1.0},
+            "mode_weights": {"url": 1.0, "ascii": 0.0},
+            "url": {"provider": "pollinations_enter", "width": 512, "height": 512, "model": "flux"},
+        },
+    }
+    gen = VisualGenerator(cfg)
+    visual = gen.generate(theme="render", mood="soft_ominous", phase="emergence", day=2)
+    assert visual.kind == "url"
+    assert visual.provider in {"pollinations", "pollinations_fallback"}
+    assert visual.meta.get("pollinations_enter_fallback_used") is True
+    assert visual.meta.get("pollinations_enter_error_reason") == "no_key"

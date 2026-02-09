@@ -357,10 +357,21 @@ class MuAgent:
             ).strip().lower()
             runware_error_reason = str((visual.meta or {}).get("runware_error_reason", "")).strip().lower()
             runware_error_detail = _truncate_text(str((visual.meta or {}).get("runware_error_detail", "")), 220)
+            pollinations_enter_error_reason = str(
+                (visual.meta or {}).get("pollinations_enter_error_reason", "")
+            ).strip().lower()
+            pollinations_enter_error_detail = _truncate_text(
+                str((visual.meta or {}).get("pollinations_enter_error_detail", "")),
+                220,
+            )
             fallback_provider_used = str((visual.meta or {}).get("fallback_provider_used", "")).strip().lower()
             runware_fallback_used = (
                 requested_url_provider == "runware"
                 and visual.provider != "runware"
+            )
+            pollinations_enter_fallback_used = (
+                requested_url_provider == "pollinations_enter"
+                and visual.provider != "pollinations_enter"
             )
             feed_titles: list[str] = []
             feed_topics: list[str] = []
@@ -393,6 +404,7 @@ class MuAgent:
                     "kind": visual.kind,
                     "provider": visual.provider,
                     "prompt": _truncate_text(visual.prompt, 500),
+                    "visual_url": _truncate_text(visual.url, 600),
                     "mode_flag": visual_mode_flag,
                     "operator_forced": force_visual_mode,
                     "theme": action.theme,
@@ -413,6 +425,9 @@ class MuAgent:
                     "runware_fallback_used": runware_fallback_used,
                     "runware_error_reason": runware_error_reason,
                     "runware_error_detail": runware_error_detail,
+                    "pollinations_enter_error_reason": pollinations_enter_error_reason,
+                    "pollinations_enter_error_detail": pollinations_enter_error_detail,
+                    "pollinations_enter_fallback_used": pollinations_enter_fallback_used,
                     "fallback_provider_used": fallback_provider_used,
                 },
             )
