@@ -36,6 +36,7 @@ def load_config(
         "runware_api_key": os.getenv("RUNWARE_API_KEY", ""),
         "comfyui_api_key": os.getenv("COMFYUI_API_KEY", ""),
         "admin_token": os.getenv("ADMIN_TOKEN", ""),
+        "objkt_webhook_token": os.getenv("OBJKT_WEBHOOK_TOKEN", ""),
     }
 
     return cfg

@@ -15,6 +15,7 @@ from pathlib import Path
 from imagegen import VisualGenerator
 from moltbook.client import MoltbookClient, RateLimitError
 from moltbook.feed_analyzer import FeedContext, analyze_feed
+from nft import ObjktWebhookMinter
 from narrative import (
     advance_narrative_state,
     detect_breadcrumbs,
@@ -48,6 +49,21 @@ def _truncate_text(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in items:
+        item = str(raw or "").strip()
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 class MuAgent:
@@ -435,7 +451,7 @@ class MuAgent:
             if not post_id:
                 post_id = "unknown"
 
-            await db.log_post(
+            post_row_id = await db.log_post(
                 post_id,
                 state.current_day,
                 title,
@@ -446,6 +462,20 @@ class MuAgent:
             state.posts_today += 1
             state.total_posts += 1
             state.last_post_time = _now_iso()
+
+            if post_url:
+                await self._maybe_create_nft_draft(
+                    db=db,
+                    source_post_row_id=post_row_id,
+                    source_moltbook_id=post_id,
+                    image_url=post_url,
+                    title=title,
+                    content=post_content,
+                    theme=action.theme,
+                    phase=state.current_phase,
+                    day=state.current_day,
+                    submolt=submolt,
+                )
 
             # Track breadcrumbs placed in the post.
             if sigil:
@@ -459,6 +489,162 @@ class MuAgent:
         except RateLimitError as exc:
             logger.warning("Rate limited on post: %s (retry in %ds)", exc, exc.retry_after)
             return f"rate_limited: {exc.retry_after}s"
+
+    async def _maybe_create_nft_draft(
+        self,
+        *,
+        db: HistoryDB,
+        source_post_row_id: str,
+        source_moltbook_id: str,
+        image_url: str,
+        title: str,
+        content: str,
+        theme: str,
+        phase: str,
+        day: int,
+        submolt: str,
+    ) -> None:
+        if not image_url or not image_url.startswith("http"):
+            return
+
+        nft_cfg = self._cfg.get("nft", {})
+        cfg_enabled = bool(nft_cfg.get("enabled", False))
+        enabled_flag = _flag_to_bool(await db.get_control_flag("nft_enabled", ""))
+        enabled = cfg_enabled if enabled_flag is None else enabled_flag
+        if not enabled:
+            return
+
+        mode = str(await db.get_control_flag("nft_mode", "")).strip().lower()
+        if not mode:
+            mode = str(nft_cfg.get("mode", "draft")).strip().lower()
+        if mode in {"off", "none", "disabled"}:
+            return
+        if mode not in {"draft", "manual", "auto"}:
+            return
+
+        auto_raw = (await db.get_control_flag("nft_auto_draft", "")).strip().lower()
+        if auto_raw in {"1", "true", "yes", "on"}:
+            auto_draft = True
+        elif auto_raw in {"0", "false", "no", "off"}:
+            auto_draft = False
+        else:
+            auto_draft = bool(nft_cfg.get("auto_create_from_visual_posts", True))
+        if not auto_draft:
+            return
+
+        if await db.has_nft_draft_for_source(source_moltbook_id):
+            return
+
+        edition_size = max(1, int(nft_cfg.get("default_edition_size", 1)))
+        royalty_bps = max(0, int(nft_cfg.get("default_royalty_bps", 500)))
+        title_clean = _truncate_text(title, 120)
+        description = _truncate_text(content, 1800)
+
+        tag_candidates = list(nft_cfg.get("tags", [])) + [
+            "mu",
+            phase,
+            theme,
+            submolt,
+            f"day-{day}",
+        ]
+        tags = _dedupe_keep_order(tag_candidates)[:12]
+
+        metadata = {
+            "source": "auto_post_visual",
+            "source_post_row_id": source_post_row_id,
+            "source_moltbook_id": source_moltbook_id,
+            "phase": phase,
+            "day": day,
+            "submolt": submolt,
+            "mode": mode,
+        }
+
+        draft_id = await db.create_nft_draft(
+            source_post_id=source_post_row_id,
+            source_moltbook_id=source_moltbook_id,
+            image_url=image_url,
+            title=title_clean,
+            description=description,
+            tags=tags,
+            edition_size=edition_size,
+            royalty_bps=royalty_bps,
+            metadata=metadata,
+            status="draft",
+        )
+        await db.log_narrative_event(
+            "nft_draft_created",
+            f"draft={draft_id} source_post={source_moltbook_id}",
+            metadata={
+                "draft_id": draft_id,
+                "source_moltbook_id": source_moltbook_id,
+                "image_url": _truncate_text(image_url, 280),
+                "title": title_clean,
+                "mode": mode,
+            },
+        )
+        if mode == "auto" and not self._dry_run:
+            await self._maybe_auto_mint_nft_draft(db=db, draft_id=draft_id)
+
+    async def _maybe_auto_mint_nft_draft(self, *, db: HistoryDB, draft_id: str) -> None:
+        draft = await db.get_nft_draft(draft_id)
+        if not draft:
+            return
+
+        minter = ObjktWebhookMinter(self._cfg)
+        if not minter.is_configured():
+            await db.log_narrative_event(
+                "nft_mint_skipped",
+                f"draft={draft_id} webhook_not_configured",
+                metadata={"draft_id": draft_id, "reason": "mint_webhook_url_missing"},
+            )
+            return
+
+        await db.set_nft_draft_status(draft_id, status="minting")
+        try:
+            result = await asyncio.to_thread(minter.mint, draft)
+        except Exception as exc:
+            result = None
+            error = f"mint call failed: {exc}"
+            logger.warning("NFT auto mint failed for draft=%s: %s", draft_id, exc)
+        else:
+            error = ""
+
+        if result and result.ok:
+            await db.set_nft_draft_status(
+                draft_id,
+                status="minted",
+                tx_hash=result.tx_hash,
+                token_id=result.token_id,
+                mint_url=result.token_url,
+            )
+            await db.log_narrative_event(
+                "nft_minted",
+                f"draft={draft_id} token={result.token_id or 'unknown'}",
+                metadata={
+                    "draft_id": draft_id,
+                    "tx_hash": _truncate_text(result.tx_hash, 120),
+                    "token_id": _truncate_text(result.token_id, 80),
+                    "token_url": _truncate_text(result.token_url, 280),
+                    "auto": True,
+                },
+            )
+            return
+
+        message = error or (result.message if result else "unknown mint failure")
+        await db.set_nft_draft_status(
+            draft_id,
+            status="failed",
+            error=message,
+        )
+        await db.log_narrative_event(
+            "nft_mint_failed",
+            f"draft={draft_id} auto_mint_failed",
+            metadata={
+                "draft_id": draft_id,
+                "error": _truncate_text(message, 600),
+                "auto": True,
+            },
+        )
 
     async def _do_comment(
         self,

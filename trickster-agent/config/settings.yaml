@@ -134,6 +134,33 @@ visual_posting:
     height: 14
     add_code_fence: true
 
+# NFT drafts + optional mint adapter (objkt via webhook worker)
+nft:
+  enabled: false
+  # off | draft | manual | auto
+  mode: "draft"
+  auto_create_from_visual_posts: true
+  default_edition_size: 1
+  default_royalty_bps: 500
+  tags:
+    - "mu"
+    - "ai-art"
+    - "moltbook"
+  objkt:
+    # External signer/minter endpoint. Keep empty until you have a minter worker.
+    mint_webhook_url: ""
+    timeout_seconds: 20
+    collection_id: ""
+    creator_address: ""
+    # Worker backend mode: dry_run | command | pytezos
+    worker_mode: "dry_run"
+    # Used when worker_mode=command (stdin JSON -> stdout JSON)
+    mint_command: ""
+    # Used when worker_mode=pytezos
+    tezos_shell: "mainnet"
+    fa2_contract: ""
+    entrypoint: "mint"
+
 # Narrative System
 narrative:
   # The "Day X" counter

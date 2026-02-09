@@ -21,10 +21,12 @@ echo '[3/4] restart services'
 systemctl restart trickster-agent || true
 systemctl restart trickster-admin || true
 systemctl restart trickster-thinker || true
+systemctl restart trickster-objkt-worker || true
 echo '[4/4] status'
 systemctl is-active trickster-agent || true
 systemctl is-active trickster-admin || true
 systemctl is-active trickster-thinker || true
+systemctl is-active trickster-objkt-worker || true
 "@
 
 Write-Host "Running on ${SshUser}@${ServerIp}: update repo + restart services" -ForegroundColor Cyan

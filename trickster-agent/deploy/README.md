@@ -74,7 +74,7 @@ Modes:
 - `Debug` panel:
   - runtime snapshot,
   - key file states/sizes,
-  - `systemctl is-active/is-enabled` for `trickster-agent`, `trickster-admin`, `trickster-thinker`.
+  - `systemctl is-active/is-enabled` for `trickster-agent`, `trickster-admin`, `trickster-thinker`, `trickster-objkt-worker`.
 
 If `ADMIN_TOKEN` is set in `.env`, paste it in UI token field.
 Token is passed as URL query (`?token=...`) to avoid browser header encoding issues.
@@ -89,6 +89,39 @@ sudo INTERVAL_MINUTES=45 deploy/install_conscious_thinker.sh
 
 This writes autonomous thought entries into `thought_journal` table.
 They are visible in the admin activity panel.
+
+## 5b. NFT mint worker (objkt webhook)
+
+Install worker service:
+
+```bash
+cd /opt/trickster-agent/repo/trickster-agent
+chmod +x deploy/install_objkt_worker.sh
+sudo OBJKT_WORKER_HOST=127.0.0.1 OBJKT_WORKER_PORT=9898 deploy/install_objkt_worker.sh
+```
+
+Set webhook URL in `config/settings.yaml`:
+
+```yaml
+nft:
+  enabled: true
+  mode: "draft"   # draft | manual | auto
+  objkt:
+    mint_webhook_url: "http://127.0.0.1:9898/mint"
+```
+
+Worker health check:
+
+```bash
+curl -s http://127.0.0.1:9898/health
+```
+
+Notes:
+- `mode=draft`: only create NFT drafts from visual posts.
+- `mode=manual`: drafts + mint manually from admin panel.
+- `mode=auto`: draft is created and mint is attempted automatically after posting.
+- Keep `OBJKT_WEBHOOK_TOKEN` the same in both agent/admin environment and worker environment.
+- Worker `dry_run` mode returns a fake token URL. For real on-chain mint use worker mode `command` or `pytezos`.
 
 ## 6. Заливка отдельных файлов на сервер (без git)
 
@@ -141,6 +174,7 @@ systemctl status trickster-agent --no-pager -l
 journalctl -u trickster-agent -f
 systemctl status trickster-admin --no-pager -l
 systemctl status trickster-thinker --no-pager -l
+systemctl status trickster-objkt-worker --no-pager -l
 ```
 
 Quick post activity API check:

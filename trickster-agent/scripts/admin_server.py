@@ -34,6 +34,7 @@ from agent.config import load_config
 from agent.personality import Personality
 from imagegen import VisualGenerator
 from moltbook.client import MoltbookClient, MoltbookError
+from nft import ObjktWebhookMinter
 
 try:
     from agent.conscious_framework import load_conscious_framework
@@ -106,6 +107,30 @@ def _file_snapshot(path: Path) -> dict[str, Any]:
     return info
 
 
+def _json_load_maybe_dict(text: Any) -> dict[str, Any]:
+    if isinstance(text, dict):
+        return text
+    if not isinstance(text, str) or not text.strip():
+        return {}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _json_load_maybe_list(text: Any) -> list[Any]:
+    if isinstance(text, list):
+        return text
+    if not isinstance(text, str) or not text.strip():
+        return []
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        return []
+    return data if isinstance(data, list) else []
+
+
 def _ensure_admin_tables(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -167,6 +192,29 @@ def _ensure_admin_tables(db_path: Path) -> None:
                 created_at TEXT,
                 processed_at TEXT,
                 error TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS nft_drafts (
+                id TEXT PRIMARY KEY,
+                source_post_id TEXT,
+                source_moltbook_id TEXT,
+                image_url TEXT,
+                title TEXT,
+                description TEXT,
+                tags TEXT,
+                edition_size INTEGER,
+                royalty_bps INTEGER,
+                status TEXT,
+                mint_tx_hash TEXT,
+                mint_token_id TEXT,
+                mint_url TEXT,
+                error TEXT,
+                metadata TEXT,
+                created_at TEXT,
+                updated_at TEXT
             )
             """
         )
@@ -293,6 +341,8 @@ class AdminContext:
             "reasoning_traces": 0,
             "pause_actions": False,
             "thinker_queue_pending": 0,
+            "nft_drafts": 0,
+            "nft_minted": 0,
         }
         if not self.db_path.exists():
             return counts
@@ -309,6 +359,10 @@ class AdminContext:
                 ).fetchone()[0]
                 counts["thinker_queue_pending"] = conn.execute(
                     "SELECT COUNT(*) FROM thinker_queue WHERE status = 'pending'"
+                ).fetchone()[0]
+                counts["nft_drafts"] = conn.execute("SELECT COUNT(*) FROM nft_drafts").fetchone()[0]
+                counts["nft_minted"] = conn.execute(
+                    "SELECT COUNT(*) FROM nft_drafts WHERE status = 'minted'"
                 ).fetchone()[0]
                 row = conn.execute(
                     "SELECT value FROM control_flags WHERE key = 'pause_actions' LIMIT 1"
@@ -683,6 +737,261 @@ class AdminContext:
         }
         return payload
 
+    def _nft_effective_flags(self) -> dict[str, Any]:
+        flags = self.get_control_flags()
+        nft_cfg = self.cfg.get("nft", {}) if isinstance(self.cfg, dict) else {}
+
+        enabled_raw = str(flags.get("nft_enabled", "")).strip().lower()
+        if enabled_raw in {"1", "true", "yes", "on"}:
+            enabled = True
+        elif enabled_raw in {"0", "false", "no", "off"}:
+            enabled = False
+        else:
+            enabled = bool(nft_cfg.get("enabled", False))
+
+        mode = str(flags.get("nft_mode", "")).strip().lower()
+        if not mode:
+            mode = str(nft_cfg.get("mode", "draft")).strip().lower()
+        if mode not in {"off", "draft", "manual", "auto"}:
+            mode = "draft"
+
+        auto_draft_raw = str(flags.get("nft_auto_draft", "")).strip().lower()
+        if auto_draft_raw in {"1", "true", "yes", "on"}:
+            auto_draft = True
+        elif auto_draft_raw in {"0", "false", "no", "off"}:
+            auto_draft = False
+        else:
+            auto_draft = bool(nft_cfg.get("auto_create_from_visual_posts", True))
+
+        return {
+            "enabled": enabled,
+            "mode": mode,
+            "auto_draft": auto_draft,
+        }
+
+    @staticmethod
+    def _normalize_nft_row(row: dict[str, Any]) -> dict[str, Any]:
+        item = dict(row)
+        item["tags"] = _json_load_maybe_list(item.get("tags", ""))
+        item["metadata"] = _json_load_maybe_dict(item.get("metadata", ""))
+        return item
+
+    def fetch_nft_status(self, limit: int = 20) -> dict[str, Any]:
+        nft_cfg = self.cfg.get("nft", {}) if isinstance(self.cfg, dict) else {}
+        secrets = self.cfg.get("_secrets", {}) if isinstance(self.cfg, dict) else {}
+        effective = self._nft_effective_flags()
+
+        recent_drafts: list[dict[str, Any]] = []
+        counts = {"total": 0, "draft": 0, "minting": 0, "minted": 0, "failed": 0}
+        visual_candidates: list[dict[str, Any]] = []
+        if self.db_path.exists():
+            try:
+                with self._connect() as conn:
+                    rows = conn.execute(
+                        "SELECT * FROM nft_drafts ORDER BY created_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                    recent_drafts = [self._normalize_nft_row(dict(r)) for r in rows]
+
+                    counts["total"] = conn.execute("SELECT COUNT(*) FROM nft_drafts").fetchone()[0]
+                    for st in ("draft", "minting", "minted", "failed"):
+                        counts[st] = conn.execute(
+                            "SELECT COUNT(*) FROM nft_drafts WHERE status = ?",
+                            (st,),
+                        ).fetchone()[0]
+
+                    candidates = conn.execute(
+                        "SELECT id, moltbook_id, title, submolt, image_path, created_at "
+                        "FROM posts "
+                        "WHERE image_path LIKE 'http%' "
+                        "ORDER BY created_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                    visual_candidates = [dict(r) for r in candidates]
+            except sqlite3.Error:
+                pass
+
+        objkt_cfg = nft_cfg.get("objkt", {}) if isinstance(nft_cfg, dict) else {}
+        webhook_url = str(objkt_cfg.get("mint_webhook_url", "")).strip()
+        return {
+            "effective": effective,
+            "counts": counts,
+            "defaults": {
+                "edition_size": int(nft_cfg.get("default_edition_size", 1)),
+                "royalty_bps": int(nft_cfg.get("default_royalty_bps", 500)),
+                "tags": nft_cfg.get("tags", []),
+            },
+            "objkt": {
+                "webhook_configured": bool(webhook_url),
+                "webhook_url": webhook_url,
+                "token_present": bool(str(secrets.get("objkt_webhook_token", "")).strip()),
+                "collection_id": str(objkt_cfg.get("collection_id", "")),
+                "creator_address": str(objkt_cfg.get("creator_address", "")),
+            },
+            "control_flags": {k: v for k, v in self.get_control_flags().items() if k.startswith("nft_")},
+            "recent_drafts": recent_drafts,
+            "visual_candidates": visual_candidates,
+            "limit": limit,
+        }
+
+    def create_nft_draft_from_post(self, *, post_ref: str = "") -> dict[str, Any]:
+        nft_cfg = self.cfg.get("nft", {}) if isinstance(self.cfg, dict) else {}
+        tags_default = nft_cfg.get("tags", []) if isinstance(nft_cfg, dict) else []
+        edition_size = max(1, int(nft_cfg.get("default_edition_size", 1)))
+        royalty_bps = max(0, int(nft_cfg.get("default_royalty_bps", 500)))
+        now = _now_iso()
+
+        with self._connect() as conn:
+            post_row = None
+            if post_ref:
+                post_row = conn.execute(
+                    "SELECT id, moltbook_id, title, content, submolt, image_path, created_at "
+                    "FROM posts WHERE (id = ? OR moltbook_id = ?) AND image_path LIKE 'http%' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (post_ref, post_ref),
+                ).fetchone()
+            if post_row is None:
+                post_row = conn.execute(
+                    "SELECT id, moltbook_id, title, content, submolt, image_path, created_at "
+                    "FROM posts WHERE image_path LIKE 'http%' ORDER BY created_at DESC LIMIT 1"
+                ).fetchone()
+            if post_row is None:
+                raise ValueError("no_visual_post_with_url_found")
+
+            post = dict(post_row)
+            source_moltbook_id = str(post.get("moltbook_id") or post.get("id") or "").strip()
+            if source_moltbook_id:
+                existing = conn.execute(
+                    "SELECT id FROM nft_drafts WHERE source_moltbook_id = ? LIMIT 1",
+                    (source_moltbook_id,),
+                ).fetchone()
+                if existing:
+                    draft = conn.execute(
+                        "SELECT * FROM nft_drafts WHERE id = ? LIMIT 1",
+                        (existing["id"],),
+                    ).fetchone()
+                    return {"created": False, "draft": self._normalize_nft_row(dict(draft))}
+
+            draft_id = str(uuid.uuid4())
+            title = str(post.get("title", "") or "Mu Artifact").strip()[:120]
+            content = str(post.get("content", "") or "").strip()
+            description = content[:1800] or f"Mu artifact generated from post {source_moltbook_id}."
+            image_url = str(post.get("image_path", "")).strip()
+            tags = []
+            for tag in list(tags_default) + ["mu", str(post.get("submolt", "")).strip(), "moltbook"]:
+                clean = str(tag or "").strip()
+                if clean and clean.lower() not in {t.lower() for t in tags}:
+                    tags.append(clean)
+
+            metadata = {
+                "source": "post_visual_url",
+                "source_post_id": str(post.get("id", "")),
+                "source_moltbook_id": source_moltbook_id,
+                "post_created_at": str(post.get("created_at", "")),
+            }
+            conn.execute(
+                "INSERT INTO nft_drafts ("
+                "id, source_post_id, source_moltbook_id, image_url, title, description, tags, edition_size, royalty_bps, "
+                "status, mint_tx_hash, mint_token_id, mint_url, error, metadata, created_at, updated_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', '', '', '', '', ?, ?, ?)",
+                (
+                    draft_id,
+                    str(post.get("id", "")),
+                    source_moltbook_id,
+                    image_url,
+                    title,
+                    description,
+                    json.dumps(tags),
+                    edition_size,
+                    royalty_bps,
+                    json.dumps(metadata),
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO narrative_events (id, event_type, description, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    "nft_draft_created",
+                    f"draft={draft_id} source={source_moltbook_id}",
+                    now,
+                    json.dumps({"draft_id": draft_id, "source_moltbook_id": source_moltbook_id}),
+                ),
+            )
+            conn.commit()
+
+            draft = conn.execute("SELECT * FROM nft_drafts WHERE id = ? LIMIT 1", (draft_id,)).fetchone()
+            return {"created": True, "draft": self._normalize_nft_row(dict(draft))}
+
+    def mint_nft_draft(self, draft_id: str) -> dict[str, Any]:
+        now = _now_iso()
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM nft_drafts WHERE id = ? LIMIT 1", (draft_id,)).fetchone()
+            if row is None:
+                raise ValueError("draft_not_found")
+            draft = self._normalize_nft_row(dict(row))
+            if str(draft.get("status", "")).lower() == "minted":
+                return {"ok": True, "already_minted": True, "draft": draft}
+
+            conn.execute(
+                "UPDATE nft_drafts SET status = 'minting', error = '', updated_at = ? WHERE id = ?",
+                (now, draft_id),
+            )
+            conn.commit()
+
+        minter = ObjktWebhookMinter(self.cfg)
+        result = minter.mint(draft)
+        now2 = _now_iso()
+        with self._connect() as conn:
+            if result.ok:
+                conn.execute(
+                    "UPDATE nft_drafts SET status = 'minted', mint_tx_hash = ?, mint_token_id = ?, mint_url = ?, "
+                    "error = '', updated_at = ? WHERE id = ?",
+                    (result.tx_hash, result.token_id, result.token_url, now2, draft_id),
+                )
+                event_type = "nft_minted"
+                event_desc = f"draft={draft_id} token={result.token_id or '?'}"
+            else:
+                conn.execute(
+                    "UPDATE nft_drafts SET status = 'failed', error = ?, updated_at = ? WHERE id = ?",
+                    (result.message[:2000], now2, draft_id),
+                )
+                event_type = "nft_mint_failed"
+                event_desc = f"draft={draft_id} error={result.message[:120]}"
+
+            conn.execute(
+                "INSERT INTO narrative_events (id, event_type, description, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    event_type,
+                    event_desc,
+                    now2,
+                    json.dumps(
+                        {
+                            "draft_id": draft_id,
+                            "ok": result.ok,
+                            "tx_hash": result.tx_hash,
+                            "token_id": result.token_id,
+                            "token_url": result.token_url,
+                            "message": result.message,
+                            "raw_response": result.raw_response or {},
+                        }
+                    ),
+                ),
+            )
+            conn.commit()
+
+            updated = conn.execute("SELECT * FROM nft_drafts WHERE id = ? LIMIT 1", (draft_id,)).fetchone()
+            return {
+                "ok": result.ok,
+                "message": result.message,
+                "draft": self._normalize_nft_row(dict(updated)),
+                "tx_hash": result.tx_hash,
+                "token_id": result.token_id,
+                "token_url": result.token_url,
+            }
+
     def enqueue_influence(self, question: str, instruction: str) -> str:
         cmd_id = str(uuid.uuid4())
         with self._connect() as conn:
@@ -770,6 +1079,7 @@ class AdminContext:
                 self._service_status("trickster-agent"),
                 self._service_status("trickster-admin"),
                 self._service_status("trickster-thinker"),
+                self._service_status("trickster-objkt-worker"),
             ],
             "framework": {
                 "dir": str(self.framework_dir),
@@ -979,6 +1289,16 @@ class AdminHandler(BaseHTTPRequestHandler):
                 limit = 20
             limit = max(1, min(200, limit))
             self._send_json(200, self.ctx.fetch_visual_why(limit=limit))
+            return
+
+        if path == "/api/nft/status":
+            params = parse_qs(parsed.query)
+            try:
+                limit = int(params.get("limit", ["20"])[0])
+            except ValueError:
+                limit = 20
+            limit = max(1, min(200, limit))
+            self._send_json(200, self.ctx.fetch_nft_status(limit=limit))
             return
 
         if path == "/api/activity":
@@ -1220,6 +1540,59 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._send_json(200, payload)
             return
 
+        if path == "/api/control/nft":
+            enabled = _to_bool(body.get("enabled", False), default=False)
+            mode = str(body.get("mode", "draft")).strip().lower()
+            auto_draft = _to_bool(body.get("auto_draft", True), default=True)
+            if mode not in {"off", "draft", "manual", "auto"}:
+                self._send_json(400, {"error": "invalid_mode"})
+                return
+            self.ctx.set_control_flag("nft_enabled", "1" if enabled else "0")
+            self.ctx.set_control_flag("nft_mode", mode)
+            self.ctx.set_control_flag("nft_auto_draft", "1" if auto_draft else "0")
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "control_flags": self.ctx.get_control_flags(),
+                    "nft_status": self.ctx.fetch_nft_status(limit=10),
+                },
+            )
+            return
+
+        if path == "/api/nft/draft":
+            post_ref = str(body.get("post_id", "")).strip()
+            try:
+                result = self.ctx.create_nft_draft_from_post(post_ref=post_ref)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(500, {"error": f"draft_failed: {exc}"})
+                return
+            self._send_json(200, result)
+            return
+
+        if path == "/api/nft/mint":
+            draft_id = str(body.get("draft_id", "")).strip()
+            confirm_text = str(body.get("confirm_text", "")).strip().upper()
+            if not draft_id:
+                self._send_json(400, {"error": "draft_id_required"})
+                return
+            if confirm_text != "MINT":
+                self._send_json(400, {"error": "confirm_text_must_be_MINT"})
+                return
+            try:
+                result = self.ctx.mint_nft_draft(draft_id)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
+            except Exception as exc:
+                self._send_json(500, {"error": f"mint_failed: {exc}"})
+                return
+            self._send_json(200, result)
+            return
+
         if path == "/api/control/run_once":
             dry_run = _to_bool(body.get("dry_run", True), default=True)
             timeout_seconds = int(body.get("timeout_seconds", 240))
@@ -1303,6 +1676,7 @@ _INDEX_HTML = """<!doctype html>
       <span id="health" class="pill muted">loading</span>
       <span id="pauseState" class="pill muted">pause: unknown</span>
       <span id="runwareState" class="pill muted">runware: unknown</span>
+      <span id="nftState" class="pill muted">nft: unknown</span>
     </div>
     <div class="grid">
       <div class="card">
@@ -1371,6 +1745,42 @@ _INDEX_HTML = """<!doctype html>
           <button onclick="refreshVisualWhy()">Refresh Why</button>
         </div>
         <div id="visualWhy" class="mono">loading...</div>
+      </div>
+
+      <div class="card">
+        <h2>NFT / objkt</h2>
+        <div class="row">
+          <label class="muted"><input id="nftEnabled" type="checkbox" /> enabled</label>
+          <label class="muted">mode</label>
+          <select id="nftMode">
+            <option value="off">off</option>
+            <option value="draft" selected>draft</option>
+            <option value="manual">manual</option>
+            <option value="auto">auto</option>
+          </select>
+          <label class="muted"><input id="nftAutoDraft" type="checkbox" checked /> auto draft</label>
+          <button onclick="saveNftConfig()">Apply NFT</button>
+          <label class="muted">limit</label>
+          <select id="nftLimit">
+            <option value="5">5</option>
+            <option value="10">10</option>
+            <option value="20" selected>20</option>
+            <option value="50">50</option>
+            <option value="100">100</option>
+          </select>
+          <button onclick="refreshNftStatus()">Refresh NFT</button>
+        </div>
+        <div class="row">
+          <input id="nftPostRef" type="text" placeholder="post_id or moltbook_id (empty = latest visual post)" style="min-width:360px;" />
+          <button onclick="createNftDraft()">Create Draft</button>
+        </div>
+        <div class="row">
+          <input id="nftDraftId" type="text" placeholder="draft_id to mint" style="min-width:320px;" />
+          <input id="nftMintConfirm" type="text" placeholder="type MINT" style="max-width:140px;" />
+          <button onclick="mintNftDraft()">Mint Draft</button>
+        </div>
+        <div id="nftStatus" class="mono">loading...</div>
+        <div id="nftResult" class="mono muted">No NFT action yet.</div>
       </div>
 
       <div class="card">
@@ -1575,6 +1985,36 @@ _INDEX_HTML = """<!doctype html>
         el.title = message;
       }
     }
+    function updateNftBadge(statusPayload) {
+      const el = document.getElementById('nftState');
+      const effective = (statusPayload || {}).effective || {};
+      const objkt = (statusPayload || {}).objkt || {};
+      const enabled = !!effective.enabled;
+      const mode = String(effective.mode || 'off');
+      const webhookConfigured = !!objkt.webhook_configured;
+      if (!enabled || mode === 'off') {
+        el.textContent = 'nft: OFF';
+        el.className = 'pill muted';
+        return;
+      }
+      if (!webhookConfigured && (mode === 'manual' || mode === 'auto')) {
+        el.textContent = 'nft: no webhook';
+        el.className = 'pill err';
+        return;
+      }
+      if (mode === 'auto') {
+        el.textContent = 'nft: AUTO';
+        el.className = 'pill warn';
+        return;
+      }
+      if (mode === 'manual') {
+        el.textContent = 'nft: MANUAL';
+        el.className = 'pill ok';
+        return;
+      }
+      el.textContent = 'nft: DRAFT';
+      el.className = 'pill ok';
+    }
     async function refreshStatus() {
       const d = await apiGet('/api/status');
       document.getElementById('status').textContent = JSON.stringify(d, null, 2);
@@ -1587,6 +2027,11 @@ _INDEX_HTML = """<!doctype html>
       document.getElementById('thinkerEnabled').checked = thinkerEnabled;
       document.getElementById('thinkerAutoQueue').checked = thinkerAutoQueue;
       document.getElementById('thinkerMode').value = String(flags.thinker_mode || 'queue');
+      const nftEnabled = ['1', 'true', 'yes', 'on'].includes(String(flags.nft_enabled || '').toLowerCase());
+      const nftAutoDraft = !['0', 'false', 'no', 'off'].includes(String(flags.nft_auto_draft || '1').toLowerCase());
+      document.getElementById('nftEnabled').checked = nftEnabled;
+      document.getElementById('nftAutoDraft').checked = nftAutoDraft;
+      document.getElementById('nftMode').value = String(flags.nft_mode || 'draft');
     }
     async function refreshActivity() {
       const limit = Number(document.getElementById('activityLimit').value || 10);
@@ -1609,6 +2054,16 @@ _INDEX_HTML = """<!doctype html>
       const limit = Number(document.getElementById('visualWhyLimit').value || 20);
       const d = await apiGet('/api/visual/why?limit=' + encodeURIComponent(String(limit)));
       document.getElementById('visualWhy').textContent = JSON.stringify(d, null, 2);
+    }
+    async function refreshNftStatus() {
+      const limit = Number(document.getElementById('nftLimit').value || 20);
+      const d = await apiGet('/api/nft/status?limit=' + encodeURIComponent(String(limit)));
+      document.getElementById('nftStatus').textContent = JSON.stringify(d, null, 2);
+      const effective = d.effective || {};
+      document.getElementById('nftEnabled').checked = !!effective.enabled;
+      document.getElementById('nftMode').value = String(effective.mode || 'draft');
+      document.getElementById('nftAutoDraft').checked = !!effective.auto_draft;
+      updateNftBadge(d);
     }
     async function refreshLogs() {
       const lines = Number(document.getElementById('logsLimit').value || 100);
@@ -1702,6 +2157,40 @@ _INDEX_HTML = """<!doctype html>
       await refreshVisualStatus();
       await refreshVisualWhy();
     }
+    async function saveNftConfig() {
+      const enabled = document.getElementById('nftEnabled').checked;
+      const mode = document.getElementById('nftMode').value;
+      const autoDraft = document.getElementById('nftAutoDraft').checked;
+      const d = await apiPost('/api/control/nft', {enabled, mode, auto_draft: autoDraft});
+      document.getElementById('nftResult').textContent = JSON.stringify(d, null, 2);
+      await refreshNftStatus();
+      await refreshStatus();
+    }
+    async function createNftDraft() {
+      const postRef = document.getElementById('nftPostRef').value.trim();
+      const d = await apiPost('/api/nft/draft', {post_id: postRef});
+      document.getElementById('nftResult').textContent = JSON.stringify(d, null, 2);
+      const draftId = (((d || {}).draft || {}).id || '');
+      if (draftId) document.getElementById('nftDraftId').value = draftId;
+      await refreshNftStatus();
+    }
+    async function mintNftDraft() {
+      const draftId = document.getElementById('nftDraftId').value.trim();
+      const confirmText = document.getElementById('nftMintConfirm').value.trim().toUpperCase();
+      if (!draftId) {
+        alert('draft_id required');
+        return;
+      }
+      if (confirmText !== 'MINT') {
+        alert('Type MINT in confirmation field');
+        return;
+      }
+      const ok = confirm('Mint draft ' + draftId + '? This will trigger external mint webhook.');
+      if (!ok) return;
+      const d = await apiPost('/api/nft/mint', {draft_id: draftId, confirm_text: confirmText});
+      document.getElementById('nftResult').textContent = JSON.stringify(d, null, 2);
+      await refreshNftStatus();
+    }
     async function runOnce(dryRun) {
       if (!dryRun) {
         const ok = confirm('Run live heartbeat now? It may publish/comment immediately.');
@@ -1731,7 +2220,7 @@ _INDEX_HTML = """<!doctype html>
     async function refreshAll() {
       const h = document.getElementById('health');
       try {
-        await Promise.all([refreshStatus(), refreshVisualStatus(), refreshVisualWhy(), refreshActivity(), refreshTimeline(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
+        await Promise.all([refreshStatus(), refreshVisualStatus(), refreshVisualWhy(), refreshNftStatus(), refreshActivity(), refreshTimeline(), refreshLogs(), refreshReasoning(), refreshSafety(), refreshDebug()]);
         h.textContent = 'OK';
         h.className = 'pill ok';
       } catch (e) {

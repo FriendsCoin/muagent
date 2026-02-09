@@ -179,6 +179,26 @@ CREATE TABLE IF NOT EXISTS thinker_queue (
     processed_at TEXT,
     error TEXT
 );
+
+CREATE TABLE IF NOT EXISTS nft_drafts (
+    id TEXT PRIMARY KEY,
+    source_post_id TEXT,
+    source_moltbook_id TEXT,
+    image_url TEXT,
+    title TEXT,
+    description TEXT,
+    tags TEXT,
+    edition_size INTEGER,
+    royalty_bps INTEGER,
+    status TEXT,              -- "draft" | "minting" | "minted" | "failed"
+    mint_tx_hash TEXT,
+    mint_token_id TEXT,
+    mint_url TEXT,
+    error TEXT,
+    metadata TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
 """
 
 
@@ -370,6 +390,101 @@ class HistoryDB:
         cursor = await self._db.execute("SELECT key, value FROM control_flags")
         rows = await cursor.fetchall()
         return {row[0]: row[1] for row in rows}
+
+    async def create_nft_draft(
+        self,
+        *,
+        source_post_id: str = "",
+        source_moltbook_id: str = "",
+        image_url: str,
+        title: str,
+        description: str,
+        tags: list[str] | None = None,
+        edition_size: int = 1,
+        royalty_bps: int = 500,
+        metadata: dict | None = None,
+        status: str = "draft",
+    ) -> str:
+        row_id = str(uuid.uuid4())
+        now = _now_iso()
+        await self._db.execute(
+            "INSERT INTO nft_drafts ("
+            "id, source_post_id, source_moltbook_id, image_url, title, description, tags, "
+            "edition_size, royalty_bps, status, mint_tx_hash, mint_token_id, mint_url, error, metadata, created_at, updated_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '', '', '', ?, ?, ?)",
+            (
+                row_id,
+                source_post_id,
+                source_moltbook_id,
+                image_url,
+                title,
+                description,
+                json.dumps(tags or []),
+                max(1, int(edition_size)),
+                max(0, int(royalty_bps)),
+                status,
+                json.dumps(metadata or {}),
+                now,
+                now,
+            ),
+        )
+        await self._db.commit()
+        return row_id
+
+    async def get_nft_draft(self, draft_id: str) -> dict[str, Any] | None:
+        cursor = await self._db.execute(
+            "SELECT * FROM nft_drafts WHERE id = ? LIMIT 1",
+            (draft_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description]
+        return dict(zip(cols, row))
+
+    async def get_recent_nft_drafts(self, limit: int = 20) -> list[dict[str, Any]]:
+        cursor = await self._db.execute(
+            "SELECT * FROM nft_drafts ORDER BY created_at DESC LIMIT ?",
+            (max(1, limit),),
+        )
+        cols = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    async def has_nft_draft_for_source(self, source_moltbook_id: str) -> bool:
+        if not source_moltbook_id:
+            return False
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM nft_drafts WHERE source_moltbook_id = ?",
+            (source_moltbook_id,),
+        )
+        row = await cursor.fetchone()
+        return bool(row and int(row[0]) > 0)
+
+    async def set_nft_draft_status(
+        self,
+        draft_id: str,
+        *,
+        status: str,
+        tx_hash: str = "",
+        token_id: str = "",
+        mint_url: str = "",
+        error: str = "",
+    ) -> None:
+        await self._db.execute(
+            "UPDATE nft_drafts SET status = ?, mint_tx_hash = ?, mint_token_id = ?, mint_url = ?, error = ?, updated_at = ? "
+            "WHERE id = ?",
+            (
+                status,
+                tx_hash,
+                token_id,
+                mint_url,
+                error[:2000],
+                _now_iso(),
+                draft_id,
+            ),
+        )
+        await self._db.commit()
 
     async def enqueue_think_item(self, source: str, context: str) -> str:
         row_id = str(uuid.uuid4())
