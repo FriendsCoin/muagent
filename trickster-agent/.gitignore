@@ -1,0 +1,19 @@
+# Secrets
+config/.env
+
+# Runtime state / logs / databases
+data/*
+!data/.gitkeep
+
+# Python
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Virtual envs
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+Thumbs.db
