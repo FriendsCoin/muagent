@@ -19,7 +19,8 @@ param(
     [string] $SshUser = "root",
     [string] $RepoUser = "bot",
     [string] $RepoRoot = "/opt/trickster-agent/repo",
-    [string] $ProjectDir = "/opt/trickster-agent/repo/trickster-agent"
+    [string] $ProjectDir = "/opt/trickster-agent/repo/trickster-agent",
+    [switch] $InstallPlaywright
 )
 
 # We ship a bash script via base64 to avoid any quoting/escaping issues with ssh/PowerShell.
@@ -29,6 +30,7 @@ REPO_USER="__REPO_USER__"
 REPO_ROOT="__REPO_ROOT__"
 PROJECT_DIR="__PROJECT_DIR__"
 BRANCH="main"
+INSTALL_PLAYWRIGHT="__INSTALL_PLAYWRIGHT__"
 
 ts="$(date -u +%Y%m%d_%H%M%S)"
 backup_root="/opt/trickster-agent/backups"
@@ -45,6 +47,7 @@ systemctl stop trickster-objkt-worker || true
 echo "[1/5] backup runtime state (best-effort) -> $backup"
 cp -a "$PROJECT_DIR/config/.env" "$backup/" 2>/dev/null || true
 cp -a "$PROJECT_DIR/data" "$backup/" 2>/dev/null || true
+echo "Backup location: $backup"
 
 echo "[2/5] git pull (stash-first) as $REPO_USER in $REPO_ROOT"
 sudo -u "$REPO_USER" -H bash -s <<'EOS'
@@ -66,6 +69,19 @@ if [ ! -x "$PROJECT_DIR/.venv/bin/pip" ]; then
   sudo -u "$REPO_USER" -H bash -lc "cd '$PROJECT_DIR' && python3 -m venv .venv"
 fi
 sudo -u "$REPO_USER" -H bash -lc "cd '$PROJECT_DIR' && .venv/bin/pip install -U pip && .venv/bin/pip install -r requirements.txt"
+
+echo "[3.1/5] ensure runtime dirs"
+mkdir -p "$PROJECT_DIR/data/downloads" || true
+chown -R "$REPO_USER:$REPO_USER" "$PROJECT_DIR/data" || true
+
+if [ "$INSTALL_PLAYWRIGHT" = "1" ]; then
+  echo "[3.2/5] playwright setup (best-effort)"
+  # install-deps uses apt; do it as root
+  apt-get update -y || true
+  "$PROJECT_DIR/.venv/bin/python" -m playwright install-deps chromium || true
+  # install browser as app user so it lands under /home/bot/.cache/ms-playwright
+  sudo -u "$REPO_USER" -H bash -lc "cd '$PROJECT_DIR' && .venv/bin/python -m playwright install chromium" || true
+fi
 
 echo "[4/5] restore runtime state (best-effort)"
 mkdir -p "$PROJECT_DIR/data"
@@ -97,6 +113,7 @@ ss -ltnp | grep -E ':(8787|9898)\\b' || true
 $bashScript = $bashScript.Replace("__REPO_USER__", $RepoUser)
 $bashScript = $bashScript.Replace("__REPO_ROOT__", $RepoRoot)
 $bashScript = $bashScript.Replace("__PROJECT_DIR__", $ProjectDir)
+$bashScript = $bashScript.Replace("__INSTALL_PLAYWRIGHT__", $(if ($InstallPlaywright) { "1" } else { "0" }))
 $bashScript = $bashScript.Replace("__TS__", (Get-Date).ToUniversalTime().ToString("yyyyMMdd_HHmmss"))
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($bashScript)
 $b64 = [Convert]::ToBase64String($bytes)
