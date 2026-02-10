@@ -26,8 +26,9 @@ param(
   [int] $RemotePort = 8787
 )
 
+$target = "${SshUser}@${ServerIp}"
 $spec = "${LocalPort}:127.0.0.1:${RemotePort}"
-Write-Host "Starting SSH tunnel: localhost:$LocalPort -> ${SshUser}@${ServerIp}:127.0.0.1:$RemotePort" -ForegroundColor Cyan
+Write-Host "Starting SSH tunnel: localhost:$LocalPort -> ${target}:127.0.0.1:$RemotePort" -ForegroundColor Cyan
 Write-Host "Keep this window open. Stop with Ctrl+C." -ForegroundColor DarkGray
 
-ssh -N -L $spec "$SshUser@$ServerIp"
+ssh -N -L $spec $target
