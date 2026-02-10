@@ -35,9 +35,55 @@ APP_DIR='$AppDir'
 APP_USER='$AppUser'
 KEY_NAME='$KeyName'
 KEY_VALUE='$KeyValue'
-cd `"$APP_DIR`"
-chmod +x deploy/set_env.sh
-APP_DIR=`"$APP_DIR`" APP_USER=`"$APP_USER`" KEY_NAME=`"$KEY_NAME`" KEY_VALUE=`"$KEY_VALUE`" ./deploy/set_env.sh
+
+ENV_FILE="`$APP_DIR/config/.env"
+mkdir -p "`$(dirname "`$ENV_FILE")"
+touch "`$ENV_FILE"
+
+python3 - "`$ENV_FILE" "`$KEY_NAME" "`$KEY_VALUE" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+env_path = Path(sys.argv[1])
+key = sys.argv[2].strip()
+value = sys.argv[3]
+
+if not re.fullmatch(r"[A-Z0-9_]+", key):
+    raise SystemExit(f"Invalid KEY_NAME: {key!r}")
+
+lines = env_path.read_text(encoding="utf-8", errors="replace").splitlines()
+out = []
+replaced = False
+pat = re.compile(rf"^\s*{re.escape(key)}\s*=")
+for line in lines:
+    if pat.match(line):
+        out.append(f"{key}={value}")
+        replaced = True
+    else:
+        out.append(line)
+if not replaced:
+    if out and out[-1].strip() != "":
+        out.append("")
+    out.append(f"{key}={value}")
+
+env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+print(f"OK: set {key} in {env_path}")
+PY
+
+chown "`$APP_USER:`$APP_USER" "`$ENV_FILE" || true
+chmod 600 "`$ENV_FILE" || true
+
+systemctl restart trickster-agent || true
+systemctl restart trickster-admin || true
+systemctl restart trickster-thinker || true
+systemctl restart trickster-objkt-worker || true
+
+echo "Service states:"
+systemctl is-active trickster-agent || true
+systemctl is-active trickster-admin || true
+systemctl is-active trickster-thinker || true
+systemctl is-active trickster-objkt-worker || true
 "@
 
 $bytes = [System.Text.Encoding]::UTF8.GetBytes($bash)
@@ -46,4 +92,3 @@ $remoteCmd = "echo '$b64' | base64 -d | bash"
 
 Write-Host "Updating $KeyName on $SshUser@$ServerIp ($AppDir) and restarting services..." -ForegroundColor Cyan
 ssh "$SshUser@$ServerIp" $remoteCmd
-
