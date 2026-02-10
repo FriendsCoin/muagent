@@ -25,6 +25,7 @@ from narrative import (
     should_include_sigil,
 )
 
+from skills.researcher import ResearchAgent
 from .config import load_config
 from .decision_engine import Action, DecisionEngine
 from .memory import AgentState, HistoryDB, StateManager
@@ -111,6 +112,11 @@ class MuAgent:
         self._moltbook_key = self._cfg["_secrets"]["moltbook_api_key"]
         self._visual = VisualGenerator(self._cfg)
 
+        research_cfg = self._cfg.get("research", {})
+        downloads_dir = root / str(research_cfg.get("downloads_dir", "data/downloads"))
+        browse_timeout = int(research_cfg.get("max_browse_timeout_ms", 30_000))
+        self._researcher = ResearchAgent(downloads_dir, browse_timeout_ms=browse_timeout)
+
     def set_simulation_mode(self, enabled: bool) -> None:
         """Toggle simulation mode at runtime."""
         self._simulation_mode = enabled
@@ -155,6 +161,12 @@ class MuAgent:
                             ],
                         },
                     )
+
+                research_flag = await db.get_control_flag("research_enabled", "1")
+                self._decision._research_enabled = (
+                    self._decision._research_enabled
+                    and research_flag.strip().lower() not in {"0", "false", "no", "off"}
+                )
 
                 operator_cmd = await db.get_pending_operator_command()
                 action = self._decision.decide(context, state)
@@ -292,6 +304,9 @@ class MuAgent:
         if action.type == "upvote":
             return await self._do_upvote(action, mb, db)
 
+        if action.type == "deep_research":
+            return await self._do_research(action, state, db)
+
         logger.warning("Unknown action type: %s", action.type)
         return "unknown"
 
@@ -313,23 +328,47 @@ class MuAgent:
         if should_include_sigil(next_total, self._cfg):
             sigil = get_sigil(self._cfg)
 
+        post_context = action.operator_instruction or ""
+        try:
+            recent_research = await db.get_recent_research(limit=2)
+            if recent_research:
+                snippets = [
+                    f"- {r['query']}: {r['reflection'][:150]}"
+                    for r in recent_research
+                    if r.get("reflection")
+                ]
+                if snippets:
+                    research_context = "\nRecent research insights:\n" + "\n".join(snippets)
+                    post_context = f"{post_context}\n{research_context}" if post_context else research_context
+        except Exception:
+            pass
+
         content = self._personality.generate_post_text(
             theme=action.theme,
             phase=state.current_phase,
             day=state.current_day,
-            context=action.operator_instruction,
+            context=post_context,
             total_posts=state.total_posts,
             sigil=sigil,
         )
         visual_enabled_override = _flag_to_bool(await db.get_control_flag("visual_enabled", ""))
         visual_mode_flag = (await db.get_control_flag("visual_mode", "auto")).strip().lower()
         visual_provider_flag = (await db.get_control_flag("visual_url_provider", "")).strip().lower()
+        visual_image_model_flag = (await db.get_control_flag("visual_image_model", "")).strip()
         visual_fallback_provider_flag = (await db.get_control_flag("visual_fallback_provider", "")).strip().lower()
         visual_video_provider_flag = (await db.get_control_flag("visual_video_provider", "")).strip().lower()
+        visual_video_model_flag = (await db.get_control_flag("visual_video_model", "")).strip()
+        visual_audio_model_flag = (await db.get_control_flag("visual_audio_model", "")).strip()
+        visual_audio_voice_flag = (await db.get_control_flag("visual_audio_voice", "")).strip()
+        visual_audio_format_flag = (await db.get_control_flag("visual_audio_format", "")).strip()
+        visual_audio_duration_raw = (await db.get_control_flag("visual_audio_duration", "")).strip()
+        visual_audio_instrumental_raw = (await db.get_control_flag("visual_audio_instrumental", "")).strip()
         visual_runware_attempts_raw = (await db.get_control_flag("visual_runware_max_attempts", "")).strip()
         visual_attach_prob_raw = (await db.get_control_flag("visual_attach_probability", "")).strip()
         visual_attach_prob_override: float | None = None
         visual_runware_attempts_override: int | None = None
+        visual_audio_duration_override: int | None = None
+        visual_audio_instrumental_override: bool | None = None
         if visual_attach_prob_raw:
             try:
                 parsed = float(visual_attach_prob_raw)
@@ -342,6 +381,17 @@ class MuAgent:
                 visual_runware_attempts_override = max(1, min(5, parsed_attempts))
             except ValueError:
                 visual_runware_attempts_override = None
+        if visual_audio_duration_raw:
+            try:
+                visual_audio_duration_override = max(1, min(300, int(visual_audio_duration_raw)))
+            except ValueError:
+                visual_audio_duration_override = None
+        if visual_audio_instrumental_raw:
+            low = visual_audio_instrumental_raw.strip().lower()
+            if low in {"1", "true", "yes", "on"}:
+                visual_audio_instrumental_override = True
+            elif low in {"0", "false", "no", "off"}:
+                visual_audio_instrumental_override = False
 
         instruction_low = (action.operator_instruction or "").lower()
         force_visual_mode = ""
@@ -389,8 +439,15 @@ class MuAgent:
             enabled_override=visual_enabled_override,
             attach_probability_override=visual_attach_prob_override,
             url_provider_override=visual_provider_flag,
+            url_model_override=visual_image_model_flag,
             fallback_provider_override=visual_fallback_provider_flag,
             video_provider_override=visual_video_provider_flag,
+            video_model_override=visual_video_model_flag,
+            audio_model_override=visual_audio_model_flag,
+            audio_voice_override=visual_audio_voice_flag,
+            audio_format_override=visual_audio_format_flag,
+            audio_duration_override=visual_audio_duration_override,
+            audio_instrumental_override=visual_audio_instrumental_override,
             runware_max_attempts_override=visual_runware_attempts_override,
         )
 
@@ -411,8 +468,15 @@ class MuAgent:
                 enabled_override=visual_enabled_override,
                 attach_probability_override=1.0,
                 url_provider_override=visual_provider_flag,
+                url_model_override=visual_image_model_flag,
                 fallback_provider_override=visual_fallback_provider_flag,
                 video_provider_override=visual_video_provider_flag,
+                video_model_override=visual_video_model_flag,
+                audio_model_override=visual_audio_model_flag,
+                audio_voice_override=visual_audio_voice_flag,
+                audio_format_override=visual_audio_format_flag,
+                audio_duration_override=visual_audio_duration_override,
+                audio_instrumental_override=visual_audio_instrumental_override,
                 runware_max_attempts_override=visual_runware_attempts_override,
             )
 
@@ -433,8 +497,15 @@ class MuAgent:
                             enabled_override=visual_enabled_override,
                             attach_probability_override=1.0,
                             url_provider_override=visual_provider_flag,
+                            url_model_override=visual_image_model_flag,
                             fallback_provider_override=visual_fallback_provider_flag,
                             video_provider_override=visual_video_provider_flag,
+                            video_model_override=visual_video_model_flag,
+                            audio_model_override=visual_audio_model_flag,
+                            audio_voice_override=visual_audio_voice_flag,
+                            audio_format_override=visual_audio_format_flag,
+                            audio_duration_override=visual_audio_duration_override,
+                            audio_instrumental_override=visual_audio_instrumental_override,
                             runware_max_attempts_override=visual_runware_attempts_override,
                         )
                         base_visual.meta = dict(base_visual.meta or {})
@@ -464,7 +535,14 @@ class MuAgent:
                 image_media_type=image_media_type,
                 total_posts=state.total_posts,
             )
-            audio = self._visual.tts_from_text(narration)
+            audio = self._visual.tts_from_text(
+                narration,
+                voice_override=visual_audio_voice_flag,
+                model_override=visual_audio_model_flag,
+                format_override=visual_audio_format_flag,
+                duration_override=visual_audio_duration_override,
+                instrumental_override=visual_audio_instrumental_override,
+            )
             media_audio_url = str(audio.url or "").strip()
 
             # Swap: keep the base visual as the post URL; add the audio narration link to the content.
@@ -948,3 +1026,71 @@ class MuAgent:
         except Exception as exc:
             logger.warning("Failed to upvote: %s", exc)
             return f"error: {exc}"
+
+    async def _do_research(self, action: Action, state: AgentState, db: HistoryDB) -> str:
+        """Run a research sub-loop: search → browse → reflect → store."""
+        try:
+            # 1. Generate a search query via Personality.
+            recent = await db.get_recent_research(limit=3)
+            recent_topics = [r.get("query", "") for r in recent]
+            feed_topics = [action.theme] if action.theme else []
+            query = self._personality.generate_research_query(
+                phase=state.current_phase,
+                day=state.current_day,
+                recent_topics=recent_topics,
+                feed_topics=feed_topics,
+            )
+            logger.info("Research query: %s", query)
+
+            # 2. Search DuckDuckGo.
+            hits = await self._researcher.search(query, max_results=3)
+            if not hits:
+                logger.info("Research: no search results for '%s'", query)
+                return "research_no_results"
+
+            # 3. Browse the top result.
+            best_hit = hits[0]
+            page = await self._researcher.browse(best_hit.url)
+            if not page.success:
+                logger.warning("Research browse failed: %s", page.error)
+                return f"research_browse_error: {page.error[:100]}"
+
+            # 4. Reflect on the content.
+            reflection = self._personality.generate_reflection(
+                query=query,
+                web_content=page.text[:4000],
+                phase=state.current_phase,
+                day=state.current_day,
+            )
+
+            # 5. Store in DB.
+            urls_visited = [best_hit.url]
+            topics = [query, action.theme] if action.theme and action.theme != query else [query]
+            await db.log_research_session(
+                trigger="operator" if action.operator_instruction else "curiosity",
+                query=query,
+                urls_visited=urls_visited,
+                raw_content=page.text[:5000],
+                reflection=reflection,
+                topics=topics,
+            )
+
+            # 6. Log narrative event.
+            await db.log_narrative_event(
+                "research_completed",
+                f"Researched: {query} → {best_hit.title[:80]}",
+                metadata={
+                    "query": query,
+                    "url": best_hit.url,
+                    "reflection_preview": reflection[:200],
+                },
+            )
+
+            # 7. Update state.
+            state.total_research_sessions += 1
+            state.last_research_time = _now_iso()
+
+            return f"researched: {query[:60]}"
+        except Exception as exc:
+            logger.error("Research failed: %s", exc, exc_info=True)
+            return f"research_error: {_truncate_text(str(exc), 200)}"

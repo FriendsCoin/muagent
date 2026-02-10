@@ -66,8 +66,15 @@ class VisualGenerator:
         enabled_override: bool | None = None,
         attach_probability_override: float | None = None,
         url_provider_override: str = "",
+        url_model_override: str = "",
         fallback_provider_override: str = "",
         video_provider_override: str = "",
+        video_model_override: str = "",
+        audio_model_override: str = "",
+        audio_voice_override: str = "",
+        audio_format_override: str = "",
+        audio_duration_override: int | None = None,
+        audio_instrumental_override: bool | None = None,
         runware_max_attempts_override: int | None = None,
     ) -> VisualAttachment:
         """Return a visual attachment candidate for a post."""
@@ -99,13 +106,25 @@ class VisualGenerator:
                 prompt,
                 day=day,
                 provider_override=url_provider_override,
+                model_override=url_model_override,
                 fallback_provider_override=fallback_provider_override,
                 runware_max_attempts_override=runware_max_attempts_override,
             )
         if mode == "audio":
-            return self._generate_audio(prompt=prompt)
+            return self._generate_audio(
+                prompt=prompt,
+                model_override=audio_model_override,
+                voice_override=audio_voice_override,
+                format_override=audio_format_override,
+                duration_override=audio_duration_override,
+                instrumental_override=audio_instrumental_override,
+            )
         if mode == "video":
-            return self._generate_video(prompt=prompt, video_provider_override=video_provider_override)
+            return self._generate_video(
+                prompt=prompt,
+                video_provider_override=video_provider_override,
+                video_model_override=video_model_override,
+            )
         if mode == "ascii":
             return self._generate_ascii(prompt=prompt, day=day)
         return VisualAttachment()
@@ -136,30 +155,78 @@ class VisualGenerator:
             return ""
         return f"&key={quote_plus(key)}"
 
-    def tts_from_text(self, text: str, voice_override: str = "") -> VisualAttachment:
-        """Create a TTS audio URL (Pollinations) from plain text."""
+    def tts_from_text(
+        self,
+        text: str,
+        voice_override: str = "",
+        model_override: str = "",
+        format_override: str = "",
+        duration_override: int | None = None,
+        instrumental_override: bool | None = None,
+    ) -> VisualAttachment:
+        """Create an audio URL (Pollinations) from plain text."""
         clean = " ".join(str(text or "").split())
         if not clean:
             return VisualAttachment()
-        voice = str(voice_override or self._media_cfg.get("audio_voice", "alloy")).strip() or "alloy"
-        return self._generate_audio(prompt=clean, voice_override=voice)
+        return self._generate_audio(
+            prompt=clean,
+            model_override=model_override,
+            voice_override=voice_override,
+            format_override=format_override,
+            duration_override=duration_override,
+            instrumental_override=instrumental_override,
+        )
 
-    def _generate_audio(self, *, prompt: str) -> VisualAttachment:
-        voice = str(self._media_cfg.get("audio_voice", "alloy")).strip() or "alloy"
-        return self._generate_audio(prompt=prompt, voice_override=voice)
-
-    def _generate_audio(self, *, prompt: str, voice_override: str = "") -> VisualAttachment:
+    def _generate_audio(
+        self,
+        *,
+        prompt: str,
+        model_override: str = "",
+        voice_override: str = "",
+        format_override: str = "",
+        duration_override: int | None = None,
+        instrumental_override: bool | None = None,
+    ) -> VisualAttachment:
+        model = str(model_override or self._media_cfg.get("audio_model", "")).strip()
         voice = str(voice_override or self._media_cfg.get("audio_voice", "alloy")).strip() or "alloy"
+        out_format = str(format_override or self._media_cfg.get("audio_format", "")).strip().lower()
         prompt_clean = " ".join(str(prompt or "").split())
+        if not prompt_clean:
+            return VisualAttachment()
         seed_base = hashlib.sha1(f"audio:{prompt_clean}".encode("utf-8")).hexdigest()
         seed = int(seed_base[:8], 16)
         # IMPORTANT: prompt is embedded in the URL path segment.
         # In paths, '+' is not decoded to space, so use percent-encoding (%20).
         encoded = quote(prompt_clean, safe="")
-        public_url = (
-            f"{self._pollinations_media_endpoint}/audio/{encoded}"
-            f"?voice={quote_plus(voice)}&seed={seed}"
-        )
+        # Build query string: keep it simple and tolerant of unknown models.
+        query_parts: list[str] = []
+        if model:
+            query_parts.append(f"model={quote_plus(model)}")
+        # Some models (e.g. elevenmusic) may ignore voice/output format; it's fine to still pass.
+        if voice:
+            query_parts.append(f"voice={quote_plus(voice)}")
+        if out_format:
+            query_parts.append(f"format={quote_plus(out_format)}")
+        query_parts.append(f"seed={seed}")
+
+        # Music-only options (elevenmusic / music alias).
+        model_low = model.strip().lower()
+        if model_low in {"elevenmusic", "music"}:
+            if duration_override is None:
+                duration_override = self._media_cfg.get("music_duration_seconds")
+            if instrumental_override is None:
+                instrumental_override = self._media_cfg.get("music_instrumental")
+            if duration_override is not None:
+                try:
+                    dur = int(duration_override)
+                except (TypeError, ValueError):
+                    dur = 0
+                if dur > 0:
+                    query_parts.append(f"duration={dur}")
+            if instrumental_override is not None:
+                query_parts.append(f"instrumental={'true' if bool(instrumental_override) else 'false'}")
+
+        public_url = f"{self._pollinations_media_endpoint}/audio/{encoded}?" + "&".join(query_parts)
         signed_url = public_url + self._pollinations_key_query()
         url = signed_url if (self._media_public_include_key and self._pollinations_key_query()) else public_url
         return VisualAttachment(
@@ -169,21 +236,29 @@ class VisualGenerator:
             url=url,
             meta={
                 "media_type": "audio",
+                "model": model,
                 "voice": voice,
+                "format": out_format,
                 "public_url": public_url,
                 "signed_url": signed_url if self._pollinations_key_query() else "",
                 "key_in_url": bool(self._media_public_include_key and self._pollinations_key_query()),
             },
         )
 
-    def _generate_video(self, *, prompt: str, video_provider_override: str = "") -> VisualAttachment:
+    def _generate_video(
+        self,
+        *,
+        prompt: str,
+        video_provider_override: str = "",
+        video_model_override: str = "",
+    ) -> VisualAttachment:
         provider = str(video_provider_override or self._video_provider).strip().lower() or self._video_provider
         if provider == "fal":
             visual, reason, detail = self._generate_fal_video_url(prompt=prompt)
             if visual is not None:
                 return visual
             # Fall back to pollinations URL (and higher-level pipeline may fall back further to image).
-            fallback = self._generate_pollinations_video_url(prompt=prompt)
+            fallback = self._generate_pollinations_video_url(prompt=prompt, model_override=video_model_override)
             fallback.meta = dict(fallback.meta or {})
             fallback.meta.update(
                 {
@@ -195,16 +270,17 @@ class VisualGenerator:
                 }
             )
             return fallback
-        return self._generate_pollinations_video_url(prompt=prompt)
+        return self._generate_pollinations_video_url(prompt=prompt, model_override=video_model_override)
 
-    def _generate_pollinations_video_url(self, *, prompt: str) -> VisualAttachment:
-        model = str(self._media_cfg.get("video_model", "fast")).strip() or "fast"
+    def _generate_pollinations_video_url(self, *, prompt: str, model_override: str = "") -> VisualAttachment:
+        model = str(model_override or self._media_cfg.get("video_model", "fast")).strip() or "fast"
         prompt_clean = " ".join(str(prompt or "").split())
         seed_base = hashlib.sha1(f"video:{prompt_clean}".encode("utf-8")).hexdigest()
         seed = int(seed_base[:8], 16)
         encoded = quote(prompt_clean, safe="")
+        # Pollinations serves video via the /image/{prompt} endpoint when a video-capable model is selected.
         public_url = (
-            f"{self._pollinations_media_endpoint}/video/{encoded}"
+            f"{self._pollinations_media_endpoint}/image/{encoded}"
             f"?model={quote_plus(model)}&seed={seed}"
         )
         signed_url = public_url + self._pollinations_key_query()
@@ -413,6 +489,7 @@ class VisualGenerator:
         *,
         day: int,
         provider_override: str = "",
+        model_override: str = "",
         fallback_provider_override: str = "",
         runware_max_attempts_override: int | None = None,
     ) -> VisualAttachment:
@@ -489,7 +566,7 @@ class VisualGenerator:
             provider = "pollinations"
 
         if provider == "pollinations":
-            model = self._url_cfg.get("model", "flux")
+            model = model_override or self._url_cfg.get("model", "flux")
             seed_base = hashlib.sha1(prompt.encode("utf-8")).hexdigest()
             seed = int(seed_base[:8], 16)
             encoded = quote_plus(prompt)

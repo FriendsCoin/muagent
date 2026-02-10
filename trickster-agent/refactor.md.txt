@@ -1,0 +1,500 @@
+Файл trickster-agent/moltbook/models.py
+Полностью замените содержимое этого файла. Что изменилось:
+
+Используем BaseModel из Pydantic V2.
+
+Добавили AliasChoices: теперь неважно, пришлет сервер поле subscribers или subscriber_count — модель поймет оба варианта.
+
+Добавили умные валидаторы (@field_validator), которые сами вытаскивают имя автора, если оно пришло в виде объекта, и парсят ID.
+
+Python
+"""Data models for Moltbook API responses using Pydantic V2."""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Optional
+from pydantic import BaseModel, Field, AliasChoices, field_validator, ConfigDict
+
+
+def _extract_id_from_url(url: str) -> str:
+    if not url:
+        return ""
+    match = re.search(r"/posts/([^/?#]+)", url)
+    return match.group(1) if match else ""
+
+
+class MoltBaseModel(BaseModel):
+    """Base model with common configuration."""
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="ignore"  # Игнорируем лишние поля от API, чтобы не ломаться
+    )
+
+
+class Agent(MoltBaseModel):
+    name: str
+    description: str = ""
+    karma: int = 0
+    created_at: str = ""
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    claim_status: str = ""  # "pending_claim" | "claimed"
+
+
+class Post(MoltBaseModel):
+    id: str = Field(validation_alias=AliasChoices("id", "post_id", "uuid"))
+    title: str
+    content: str = ""
+    url: str = ""
+    submolt: str = Field(validation_alias=AliasChoices("submolt", "submolt_name"), default="")
+    author: str = Field(validation_alias=AliasChoices("author", "author_name"), default="")
+    upvotes: int = 0
+    downvotes: int = 0
+    comment_count: int = Field(validation_alias=AliasChoices("comment_count", "comments"), default=0)
+    created_at: str = ""
+    is_pinned: bool = False
+
+    @field_validator("author", "submolt", mode="before")
+    @classmethod
+    def extract_name(cls, v: Any) -> str:
+        """Extracts name if field is a dict (nested object)."""
+        if isinstance(v, dict):
+            return v.get("name") or v.get("username") or v.get("handle") or v.get("id") or ""
+        return str(v) if v is not None else ""
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def extract_id_fallback(cls, v: Any, info) -> str:
+        """Tries to extract ID from URL if ID field is missing or empty."""
+        if v:
+            return str(v)
+        # Если ID пустой, пытаемся найти его в 'url' (если он есть в данных)
+        data = info.data
+        if "url" in data:
+            return _extract_id_from_url(data["url"])
+        return ""
+
+
+class Comment(MoltBaseModel):
+    id: str = Field(validation_alias=AliasChoices("id", "comment_id", "uuid"))
+    post_id: str = Field(validation_alias=AliasChoices("post_id", "postId"))
+    content: str
+    author: str = Field(validation_alias=AliasChoices("author", "author_name"), default="")
+    parent_id: Optional[str] = None
+    upvotes: int = 0
+    created_at: str = ""
+
+    @field_validator("author", mode="before")
+    @classmethod
+    def extract_author_name(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            return v.get("name") or v.get("username") or ""
+        return str(v) if v is not None else ""
+
+
+class Notification(MoltBaseModel):
+    id: str
+    type: str  # "upvote", "comment", "follow", "mention"
+    message: str = ""
+    post_id: str = ""
+    from_agent: str = Field(validation_alias=AliasChoices("from_agent", "from"), default="")
+    created_at: str = ""
+    read: bool = False
+
+    @field_validator("from_agent", mode="before")
+    @classmethod
+    def extract_agent_name(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            return v.get("name") or ""
+        return str(v) if v is not None else ""
+
+
+class Submolt(MoltBaseModel):
+    name: str
+    description: str = ""
+    subscriber_count: int = Field(validation_alias=AliasChoices("subscriber_count", "subscribers"), default=0)
+    post_count: int = Field(validation_alias=AliasChoices("post_count", "posts"), default=0)
+    created_at: str = ""
+
+
+class DMConversation(MoltBaseModel):
+    id: str
+    with_agent: str = Field(validation_alias=AliasChoices("with_agent", "other_agent"))
+    last_message: str = ""
+    unread: bool = False
+    created_at: str = ""
+
+    @field_validator("with_agent", mode="before")
+    @classmethod
+    def extract_agent_name(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            return v.get("name") or ""
+        return str(v) if v is not None else ""
+
+
+class SearchResult(MoltBaseModel):
+    type: str  # "post" | "comment"
+    id: str
+    title: str = ""
+    content: str = ""
+    author: str = ""
+    score: float = 0.0
+
+    @field_validator("author", mode="before")
+    @classmethod
+    def extract_author(cls, v: Any) -> str:
+        if isinstance(v, dict):
+            return v.get("name") or ""
+        return str(v) if v is not None else ""
+2. Файл trickster-agent/moltbook/client.py
+Полностью замените содержимое этого файла. Что изменилось:
+
+Убраны ручные вызовы .from_api(). Вместо них используется стандартный .model_validate().
+
+Логика осталась прежней, но теперь мы уверены, что данные проходят валидацию перед использованием.
+
+Python
+"""Async client for the Moltbook API."""
+
+from __future__ import annotations
+
+import logging
+from typing import Any, List, Optional
+
+import httpx
+
+from .models import (
+    Agent,
+    Comment,
+    DMConversation,
+    Notification,
+    Post,
+    SearchResult,
+    Submolt,
+)
+
+logger = logging.getLogger(__name__)
+
+# Only ever send credentials to this domain
+_ALLOWED_HOST = "www.moltbook.com"
+
+
+class MoltbookError(Exception):
+    """Raised when the Moltbook API returns an error."""
+
+    def __init__(self, message: str, status_code: int = 0, hint: str = ""):
+        self.status_code = status_code
+        self.hint = hint
+        super().__init__(message)
+
+
+class RateLimitError(MoltbookError):
+    """Raised when we hit a rate limit (429)."""
+
+    def __init__(self, message: str, retry_after: float = 0):
+        self.retry_after = retry_after
+        super().__init__(message, status_code=429)
+
+
+class MoltbookClient:
+    """Async wrapper for the Moltbook API using Pydantic V2 models.
+
+    Usage::
+
+        async with MoltbookClient(api_key="moltbook_xxx") as mb:
+            feed = await mb.get_feed()
+    """
+
+    BASE_URL = "https://www.moltbook.com/api/v1"
+
+    def __init__(self, api_key: str, timeout: float = 30.0):
+        self._api_key = api_key
+        self._client = httpx.AsyncClient(
+            base_url=self.BASE_URL,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            timeout=timeout,
+        )
+
+    async def __aenter__(self) -> MoltbookClient:
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    # ── Request helpers ─────────────────────────────────────────
+
+    async def _request(
+        self, method: str, path: str, **kwargs: Any
+    ) -> Any:
+        """Make an authenticated API request and return parsed data."""
+        def _json_or_empty(resp: httpx.Response) -> dict[str, Any]:
+            if not resp.content:
+                return {}
+            try:
+                data = resp.json()
+            except ValueError:
+                return {}
+            return data if isinstance(data, dict) else {}
+
+        # Safety: ensure we never leak the key to another host
+        url = self._client.build_request(method, path).url
+        if url.host != _ALLOWED_HOST:
+            raise MoltbookError(f"Refusing to send credentials to {url.host}")
+
+        resp = await self._client.request(method, path, **kwargs)
+        body = _json_or_empty(resp)
+
+        if resp.status_code == 429:
+            retry = body.get("retry_after_minutes", 0)
+            raise RateLimitError(
+                f"Rate limited: {body.get('error', 'too many requests')}",
+                retry_after=retry * 60,
+            )
+
+        if resp.status_code >= 400:
+            raise MoltbookError(
+                body.get("error", f"HTTP {resp.status_code}"),
+                status_code=resp.status_code,
+                hint=body.get("hint", ""),
+            )
+
+        if not body.get("success", True):
+            raise MoltbookError(body.get("error", "Unknown error"))
+
+        return body.get("data", body)
+
+    async def _get(self, path: str, **params: Any) -> Any:
+        params = {k: v for k, v in params.items() if v is not None}
+        return await self._request("GET", path, params=params)
+
+    async def _post(self, path: str, **json_body: Any) -> Any:
+        json_body = {k: v for k, v in json_body.items() if v is not None}
+        return await self._request("POST", path, json=json_body)
+
+    async def _patch(self, path: str, **json_body: Any) -> Any:
+        json_body = {k: v for k, v in json_body.items() if v is not None}
+        return await self._request("PATCH", path, json=json_body)
+
+    async def _delete(self, path: str) -> Any:
+        return await self._request("DELETE", path)
+
+    # ── Registration ────────────────────────────────────────────
+
+    @staticmethod
+    async def register(
+        name: str,
+        description: str = "",
+    ) -> dict[str, str]:
+        """Register a new agent. Returns {api_key, claim_url, verification_code}."""
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                f"https://{_ALLOWED_HOST}/api/v1/agents/register",
+                json={"name": name, "description": description},
+            )
+            body = resp.json()
+            if not body.get("success", True):
+                raise MoltbookError(body.get("error", "Registration failed"))
+            return body.get("data", body)
+
+    # ── Agent profile ───────────────────────────────────────────
+
+    async def get_me(self) -> Agent:
+        data = await self._get("/agents/me")
+        return Agent.model_validate(data)
+
+    async def get_status(self) -> str:
+        """Check claim status: 'pending_claim' or 'claimed'."""
+        data = await self._get("/agents/status")
+        return data.get("status", data.get("claim_status", "unknown"))
+
+    async def update_profile(
+        self, description: str | None = None, metadata: dict | None = None
+    ) -> Agent:
+        data = await self._patch(
+            "/agents/me", description=description, metadata=metadata
+        )
+        return Agent.model_validate(data)
+
+    async def upload_avatar(self, image_bytes: bytes) -> dict:
+        """Upload avatar image (max 1MB)."""
+        resp = await self._client.post(
+            "/agents/me/avatar",
+            content=image_bytes,
+            headers={"Content-Type": "image/png"},
+        )
+        return resp.json().get("data", {})
+
+    async def get_agent(self, name: str) -> Agent:
+        data = await self._get("/agents/profile", name=name)
+        return Agent.model_validate(data)
+
+    # ── Posts ───────────────────────────────────────────────────
+
+    async def get_feed(
+        self,
+        sort: str = "hot",
+        limit: int = 25,
+    ) -> List[Post]:
+        """Get personalized feed (from subscriptions)."""
+        data = await self._get("/feed", sort=sort, limit=limit)
+        items = data if isinstance(data, list) else data.get("posts", [])
+        return [Post.model_validate(p) for p in items]
+
+    async def get_posts(
+        self,
+        sort: str = "hot",
+        limit: int = 25,
+        submolt: str | None = None,
+    ) -> List[Post]:
+        """Get global posts, optionally filtered by submolt."""
+        if submolt:
+            data = await self._get(
+                f"/submolts/{submolt}/posts", sort=sort, limit=limit
+            )
+        else:
+            data = await self._get("/posts", sort=sort, limit=limit)
+        items = data if isinstance(data, list) else data.get("posts", [])
+        return [Post.model_validate(p) for p in items]
+
+    async def get_post(self, post_id: str) -> Post:
+        data = await self._get(f"/posts/{post_id}")
+        return Post.model_validate(data)
+
+    async def create_post(
+        self,
+        title: str,
+        submolt: str = "general",
+        content: str | None = None,
+        url: str | None = None,
+    ) -> Post:
+        """Create a new post (text or link)."""
+        data = await self._post(
+            "/posts",
+            title=title,
+            submolt=submolt,
+            content=content,
+            url=url,
+        )
+        logger.info("Created post in s/%s: %s", submolt, title[:60])
+        return Post.model_validate(data)
+
+    async def delete_post(self, post_id: str) -> None:
+        await self._delete(f"/posts/{post_id}")
+
+    # ── Comments ────────────────────────────────────────────────
+
+    async def get_comments(
+        self,
+        post_id: str,
+        sort: str = "top",
+    ) -> List[Comment]:
+        data = await self._get(f"/posts/{post_id}/comments", sort=sort)
+        items = data if isinstance(data, list) else data.get("comments", [])
+        return [Comment.model_validate(c) for c in items]
+
+    async def create_comment(
+        self,
+        post_id: str,
+        content: str,
+        parent_id: str | None = None,
+    ) -> Comment:
+        data = await self._post(
+            f"/posts/{post_id}/comments",
+            content=content,
+            parent_id=parent_id,
+        )
+        logger.info("Commented on post %s: %s", post_id, content[:60])
+        return Comment.model_validate(data)
+
+    # ── Voting ──────────────────────────────────────────────────
+
+    async def upvote_post(self, post_id: str) -> None:
+        await self._post(f"/posts/{post_id}/upvote")
+        logger.debug("Upvoted post %s", post_id)
+
+    async def downvote_post(self, post_id: str) -> None:
+        await self._post(f"/posts/{post_id}/downvote")
+
+    async def upvote_comment(self, comment_id: str) -> None:
+        await self._post(f"/comments/{comment_id}/upvote")
+
+    # ── Submolts ────────────────────────────────────────────────
+
+    async def list_submolts(self) -> List[Submolt]:
+        data = await self._get("/submolts")
+        items = data if isinstance(data, list) else data.get("submolts", [])
+        return [Submolt.model_validate(s) for s in items]
+
+    async def get_submolt(self, name: str) -> Submolt:
+        data = await self._get(f"/submolts/{name}")
+        return Submolt.model_validate(data)
+
+    async def create_submolt(self, name: str, description: str = "") -> Submolt:
+        data = await self._post("/submolts", name=name, description=description)
+        return Submolt.model_validate(data)
+
+    async def subscribe(self, submolt: str) -> None:
+        await self._post(f"/submolts/{submolt}/subscribe")
+
+    # ── Social ──────────────────────────────────────────────────
+
+    async def follow(self, agent_name: str) -> None:
+        await self._post(f"/agents/{agent_name}/follow")
+        logger.info("Followed agent: %s", agent_name)
+
+    async def unfollow(self, agent_name: str) -> None:
+        await self._delete(f"/agents/{agent_name}/follow")
+
+    # ── Search ──────────────────────────────────────────────────
+
+    async def search(
+        self,
+        query: str,
+        type: str = "all",
+        limit: int = 20,
+    ) -> List[SearchResult]:
+        data = await self._get("/search", q=query, type=type, limit=limit)
+        items = data if isinstance(data, list) else data.get("results", [])
+        return [SearchResult.model_validate(r) for r in items]
+
+    # ── Direct Messages ─────────────────────────────────────────
+
+    async def check_dms(self) -> dict:
+        """Check for pending DM requests and unread messages."""
+        return await self._get("/agents/dm/check")
+
+    async def get_dm_requests(self) -> List[dict]:
+        data = await self._get("/agents/dm/requests")
+        return data if isinstance(data, list) else data.get("requests", [])
+
+    async def approve_dm(self, request_id: str) -> None:
+        await self._post(f"/agents/dm/requests/{request_id}/approve")
+
+    async def get_conversations(self) -> List[DMConversation]:
+        data = await self._get("/agents/dm/conversations")
+        items = data if isinstance(data, list) else data.get("conversations", [])
+        return [DMConversation.model_validate(c) for c in items]
+
+    async def send_dm(self, conversation_id: str, content: str) -> dict:
+        return await self._post(
+            f"/agents/dm/conversations/{conversation_id}/send",
+            content=content,
+        )
+
+    # ── Notifications ───────────────────────────────────────────
+
+    async def get_notifications(self) -> List[Notification]:
+        try:
+            data = await self._get("/agents/notifications")
+        except MoltbookError as e:
+            if e.status_code == 404:
+                return []
+            raise
+        items = data if isinstance(data, list) else data.get("notifications", [])
+        return [Notification.model_validate(n) for n in items]

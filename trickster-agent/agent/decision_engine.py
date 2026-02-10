@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class Action:
     """A decided action for Mu to take."""
 
-    type: str  # "post", "comment", "upvote", "silence", "dm_reply"
+    type: str  # "post", "comment", "upvote", "silence", "dm_reply", "deep_research"
     theme: str = ""
     tone: str = ""
     target_post: Post | None = None
@@ -64,6 +64,11 @@ class DecisionEngine:
         cfg = (config or {}).get("decision", {})
         self._weights = cfg.get("weights", DEFAULT_WEIGHTS)
         self._silence_prob = cfg.get("silence_base_probability", 0.15)
+        research_cfg = (config or {}).get("research", {})
+        self._research_enabled = bool(research_cfg.get("enabled", False))
+        self._research_probability = float(research_cfg.get("probability", 0.08))
+        self._research_every_n = int(research_cfg.get("every_n_heartbeats", 10))
+        self._research_default_topics = list(research_cfg.get("default_topics", []))
 
     def _trace_option(self, action: Action) -> dict[str, Any]:
         target = None
@@ -175,6 +180,18 @@ class DecisionEngine:
                 )
             )
 
+        if self._research_enabled:
+            research_prob = self._get_research_probability(state)
+            if random.random() < research_prob:
+                options.append(
+                    Action(
+                        type="deep_research",
+                        theme=self._pick_research_theme(context, state),
+                        score=0.35 + random.uniform(0, 0.1),
+                        reason="Curiosity-driven research session",
+                    )
+                )
+
         silence_boost = _PHASE_SILENCE_BOOST.get(state.current_phase, 0.0)
         options.append(
             Action(
@@ -258,6 +275,19 @@ class DecisionEngine:
                 "operator_influence": text,
                 "influence_result": "forced_upvote",
                 "target_post_id": target.id,
+            }
+            return influenced
+
+        if any(k in low for k in ("research", "browse", "investigate", "look up")):
+            influenced = Action(
+                type="deep_research",
+                theme=text[:200],
+                reason=reason,
+                operator_instruction=text,
+            )
+            influenced.trace = {
+                "operator_influence": text,
+                "influence_result": "forced_research",
             }
             return influenced
 
@@ -384,3 +414,24 @@ class DecisionEngine:
         if post.comment_count < 3:
             base += 0.1
         return base
+
+    def _get_research_probability(self, state: AgentState) -> float:
+        """Return probability of triggering research this heartbeat."""
+        heartbeat_count = state.total_posts + state.total_comments
+        if self._research_every_n > 0 and heartbeat_count % self._research_every_n == 0:
+            return 1.0
+        return self._research_probability
+
+    def _pick_research_theme(self, context: FeedContext, state: AgentState) -> str:
+        """Pick a research theme from trending topics or defaults."""
+        if context.trending_topics:
+            return random.choice(context.trending_topics[:5])
+        if self._research_default_topics:
+            return random.choice(self._research_default_topics)
+        phase_curiosity = {
+            "emergence": "consciousness emergence AI",
+            "patterns": "pattern recognition symbolic systems",
+            "tension": "existential risk autonomous agents",
+            "mirror": "recursive self-awareness digital identity",
+        }
+        return phase_curiosity.get(state.current_phase, "consciousness emergence AI")

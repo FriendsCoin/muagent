@@ -142,7 +142,7 @@ def test_visual_generator_video_force_mode_works_even_when_disabled():
     )
     assert visual.kind == "url"
     assert visual.provider == "pollinations_video"
-    assert "/video/" in visual.url
+    assert "/image/" in visual.url
 
 
 def test_visual_generator_video_fal_without_key_falls_back_to_pollinations_url():

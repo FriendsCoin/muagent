@@ -232,6 +232,20 @@ def _ensure_admin_tables(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS research_sessions (
+                id TEXT PRIMARY KEY,
+                trigger TEXT,
+                query TEXT,
+                urls_visited TEXT,
+                raw_content TEXT,
+                reflection TEXT,
+                topics TEXT,
+                created_at TEXT
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -360,6 +374,7 @@ class AdminContext:
             "thinker_queue_pending": 0,
             "nft_drafts": 0,
             "nft_minted": 0,
+            "research_sessions": 0,
         }
         if not self.db_path.exists():
             return counts
@@ -381,6 +396,12 @@ class AdminContext:
                 counts["nft_minted"] = conn.execute(
                     "SELECT COUNT(*) FROM nft_drafts WHERE status = 'minted'"
                 ).fetchone()[0]
+                try:
+                    counts["research_sessions"] = conn.execute(
+                        "SELECT COUNT(*) FROM research_sessions"
+                    ).fetchone()[0]
+                except sqlite3.Error:
+                    pass
                 row = conn.execute(
                     "SELECT value FROM control_flags WHERE key = 'pause_actions' LIMIT 1"
                 ).fetchone()
@@ -519,6 +540,9 @@ class AdminContext:
         provider = str(flags.get("visual_url_provider", "")).strip().lower()
         if not provider:
             provider = str(self.cfg.get("visual_posting", {}).get("url", {}).get("provider", "pollinations"))
+        image_model = str(flags.get("visual_image_model", "")).strip()
+        if not image_model:
+            image_model = str(self.cfg.get("visual_posting", {}).get("url", {}).get("model", "")).strip()
         fallback_provider = str(flags.get("visual_fallback_provider", "")).strip().lower()
         if not fallback_provider:
             fallback_provider = str(
@@ -534,6 +558,34 @@ class AdminContext:
             ).strip().lower()
         if video_provider not in {"pollinations", "fal"}:
             video_provider = "pollinations"
+
+        video_model = str(flags.get("visual_video_model", "")).strip()
+        if not video_model:
+            video_model = str(self.cfg.get("visual_posting", {}).get("media", {}).get("video_model", "")).strip()
+
+        audio_model = str(flags.get("visual_audio_model", "")).strip()
+        if not audio_model:
+            audio_model = str(self.cfg.get("visual_posting", {}).get("media", {}).get("audio_model", "")).strip()
+        audio_voice = str(flags.get("visual_audio_voice", "")).strip()
+        if not audio_voice:
+            audio_voice = str(self.cfg.get("visual_posting", {}).get("media", {}).get("audio_voice", "")).strip()
+        audio_format = str(flags.get("visual_audio_format", "")).strip().lower()
+        if not audio_format:
+            audio_format = str(self.cfg.get("visual_posting", {}).get("media", {}).get("audio_format", "")).strip().lower()
+        audio_duration_raw = str(flags.get("visual_audio_duration", "")).strip()
+        audio_duration: int | None = None
+        if audio_duration_raw:
+            try:
+                audio_duration = max(1, min(300, int(audio_duration_raw)))
+            except ValueError:
+                audio_duration = None
+        audio_instrumental_raw = str(flags.get("visual_audio_instrumental", "")).strip().lower()
+        audio_instrumental: bool | None = None
+        if audio_instrumental_raw:
+            if audio_instrumental_raw in {"1", "true", "yes", "on"}:
+                audio_instrumental = True
+            elif audio_instrumental_raw in {"0", "false", "no", "off"}:
+                audio_instrumental = False
 
         attempts_raw = str(flags.get("visual_runware_max_attempts", "")).strip()
         attempts = None
@@ -555,8 +607,15 @@ class AdminContext:
             "enabled": enabled,
             "mode": mode,
             "url_provider": provider,
+            "image_model": image_model,
             "fallback_provider": fallback_provider,
             "video_provider": video_provider,
+            "video_model": video_model,
+            "audio_model": audio_model,
+            "audio_voice": audio_voice,
+            "audio_format": audio_format,
+            "audio_duration": audio_duration,
+            "audio_instrumental": audio_instrumental,
             "runware_max_attempts_override": attempts,
             "attach_probability_override": prob,
         }
@@ -788,6 +847,12 @@ class AdminContext:
         phase: str = "emergence",
         day: int = 1,
         video_provider: str = "",
+        video_model: str = "",
+        audio_model: str = "",
+        audio_voice: str = "",
+        audio_format: str = "",
+        audio_duration: int | None = None,
+        audio_instrumental: bool | None = None,
     ) -> dict[str, Any]:
         generator = VisualGenerator(self.cfg)
         if mode in {"audio", "video"}:
@@ -797,6 +862,12 @@ class AdminContext:
                 phase=phase,
                 day=day,
                 video_provider=video_provider,
+                video_model=video_model,
+                audio_model=audio_model,
+                audio_voice=audio_voice,
+                audio_format=audio_format,
+                audio_duration=audio_duration,
+                audio_instrumental=audio_instrumental,
             )
 
         force_mode = mode if mode in {"url", "ascii"} else ""
@@ -812,8 +883,17 @@ class AdminContext:
             enabled_override=effective["enabled"],
             attach_probability_override=1.0 if mode != "auto" else effective["attach_probability_override"],
             url_provider_override=str(effective["url_provider"] or ""),
+            url_model_override=str(effective.get("image_model") or ""),
             fallback_provider_override=str(effective.get("fallback_provider") or ""),
             video_provider_override=vp,
+            video_model_override=video_model or str(effective.get("video_model") or ""),
+            audio_model_override=audio_model or str(effective.get("audio_model") or ""),
+            audio_voice_override=audio_voice or str(effective.get("audio_voice") or ""),
+            audio_format_override=audio_format or str(effective.get("audio_format") or ""),
+            audio_duration_override=audio_duration if audio_duration is not None else effective.get("audio_duration"),
+            audio_instrumental_override=(
+                audio_instrumental if audio_instrumental is not None else effective.get("audio_instrumental")
+            ),
             runware_max_attempts_override=effective.get("runware_max_attempts_override"),
         )
         payload = {
@@ -845,6 +925,12 @@ class AdminContext:
         phase: str = "emergence",
         day: int = 1,
         video_provider: str = "",
+        video_model: str = "",
+        audio_model: str = "",
+        audio_voice: str = "",
+        audio_format: str = "",
+        audio_duration: int | None = None,
+        audio_instrumental: bool | None = None,
     ) -> dict[str, Any]:
         """Generate an image/video + narrated audio (TTS) instead of reading the prompt verbatim."""
         generator = VisualGenerator(self.cfg)
@@ -862,8 +948,17 @@ class AdminContext:
             enabled_override=effective["enabled"],
             attach_probability_override=1.0,
             url_provider_override=str(effective["url_provider"] or ""),
+            url_model_override=str(effective.get("image_model") or ""),
             fallback_provider_override=str(effective.get("fallback_provider") or ""),
             video_provider_override=vp,
+            video_model_override=video_model or str(effective.get("video_model") or ""),
+            audio_model_override=audio_model or str(effective.get("audio_model") or ""),
+            audio_voice_override=audio_voice or str(effective.get("audio_voice") or ""),
+            audio_format_override=audio_format or str(effective.get("audio_format") or ""),
+            audio_duration_override=audio_duration if audio_duration is not None else effective.get("audio_duration"),
+            audio_instrumental_override=(
+                audio_instrumental if audio_instrumental is not None else effective.get("audio_instrumental")
+            ),
             runware_max_attempts_override=effective.get("runware_max_attempts_override"),
         )
 
@@ -885,8 +980,17 @@ class AdminContext:
                         enabled_override=effective["enabled"],
                         attach_probability_override=1.0,
                         url_provider_override=str(effective["url_provider"] or ""),
+                        url_model_override=str(effective.get("image_model") or ""),
                         fallback_provider_override=str(effective.get("fallback_provider") or ""),
                         video_provider_override=vp,
+                        video_model_override=video_model or str(effective.get("video_model") or ""),
+                        audio_model_override=audio_model or str(effective.get("audio_model") or ""),
+                        audio_voice_override=audio_voice or str(effective.get("audio_voice") or ""),
+                        audio_format_override=audio_format or str(effective.get("audio_format") or ""),
+                        audio_duration_override=audio_duration if audio_duration is not None else effective.get("audio_duration"),
+                        audio_instrumental_override=(
+                            audio_instrumental if audio_instrumental is not None else effective.get("audio_instrumental")
+                        ),
                         runware_max_attempts_override=effective.get("runware_max_attempts_override"),
                     )
                     base_visual.meta = dict(base_visual.meta or {})
@@ -916,7 +1020,16 @@ class AdminContext:
             image_bytes=image_bytes,
             image_media_type=image_media_type,
         )
-        audio = generator.tts_from_text(narration)
+        audio = generator.tts_from_text(
+            narration,
+            voice_override=audio_voice or str(effective.get("audio_voice") or ""),
+            model_override=audio_model or str(effective.get("audio_model") or ""),
+            format_override=audio_format or str(effective.get("audio_format") or ""),
+            duration_override=audio_duration if audio_duration is not None else effective.get("audio_duration"),
+            instrumental_override=(
+                audio_instrumental if audio_instrumental is not None else effective.get("audio_instrumental")
+            ),
+        )
 
         return {
             "mode": mode,
@@ -1715,49 +1828,107 @@ def api_control_thinker(
 def api_control_visual(
     body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
 ):
+    enabled_present = "enabled" in body
+    mode_present = "mode" in body
+    provider_present = "url_provider" in body
+    image_model_present = "image_model" in body
+    fallback_present = "fallback_provider" in body
+    video_provider_present = "video_provider" in body
+    runware_present = "runware_max_attempts" in body
+    attach_probability_present = "attach_probability" in body
+    video_model_present = "video_model" in body
+    audio_model_present = "audio_model" in body
+    audio_voice_present = "audio_voice" in body
+    audio_format_present = "audio_format" in body
+    audio_duration_present = "audio_duration" in body
+    audio_instrumental_present = "audio_instrumental" in body
+
     enabled = _to_bool(body.get("enabled", True), default=True)
     mode = str(body.get("mode", "auto")).strip().lower()
     provider = str(body.get("url_provider", "")).strip().lower()
+    image_model = str(body.get("image_model", "")).strip()
     fallback_provider = str(body.get("fallback_provider", "")).strip().lower()
     video_provider = str(body.get("video_provider", "")).strip().lower()
+    video_model = str(body.get("video_model", "")).strip()
+    audio_model = str(body.get("audio_model", "")).strip()
+    audio_voice = str(body.get("audio_voice", "")).strip()
+    audio_format = str(body.get("audio_format", "")).strip().lower()
+    audio_duration_raw = str(body.get("audio_duration", "")).strip()
+    audio_instrumental_raw = str(body.get("audio_instrumental", "")).strip()
     runware_attempts_raw = str(body.get("runware_max_attempts", "")).strip()
     attach_probability_raw = str(body.get("attach_probability", "")).strip()
 
-    if mode not in {"auto", "url", "ascii", "audio", "video", "off"}:
-        raise HTTPException(400, "invalid_mode")
-    if provider and provider not in {"pollinations", "pollinations_enter", "runware"}:
-        raise HTTPException(400, "invalid_provider")
-    if fallback_provider and fallback_provider not in {"pollinations", "ascii"}:
-        raise HTTPException(400, "invalid_fallback_provider")
-    if video_provider and video_provider not in {"pollinations", "fal"}:
-        raise HTTPException(400, "invalid_video_provider")
+    if mode_present:
+        if mode not in {"auto", "url", "ascii", "audio", "video", "off"}:
+            raise HTTPException(400, "invalid_mode")
+    if provider_present:
+        if provider and provider not in {"pollinations", "pollinations_enter", "runware"}:
+            raise HTTPException(400, "invalid_provider")
+    if fallback_present:
+        if fallback_provider and fallback_provider not in {"pollinations", "ascii"}:
+            raise HTTPException(400, "invalid_fallback_provider")
+    if video_provider_present:
+        if video_provider and video_provider not in {"pollinations", "fal"}:
+            raise HTTPException(400, "invalid_video_provider")
 
-    ctx.set_control_flag("visual_enabled", "1" if enabled else "0")
-    ctx.set_control_flag("visual_mode", mode)
-    if provider:
+    if enabled_present:
+        ctx.set_control_flag("visual_enabled", "1" if enabled else "0")
+    if mode_present:
+        ctx.set_control_flag("visual_mode", mode)
+    if provider_present:
         ctx.set_control_flag("visual_url_provider", provider)
-    if fallback_provider:
+    if image_model_present:
+        ctx.set_control_flag("visual_image_model", image_model)
+    if fallback_present:
         ctx.set_control_flag("visual_fallback_provider", fallback_provider)
-    if video_provider:
+    if video_provider_present:
         ctx.set_control_flag("visual_video_provider", video_provider)
 
-    if runware_attempts_raw:
-        try:
-            attempts = max(1, min(5, int(runware_attempts_raw)))
-        except ValueError:
-            raise HTTPException(400, "invalid_runware_max_attempts")
-        ctx.set_control_flag("visual_runware_max_attempts", str(attempts))
-    else:
-        ctx.set_control_flag("visual_runware_max_attempts", "")
+    if video_model_present:
+        ctx.set_control_flag("visual_video_model", video_model)
+    if audio_model_present:
+        ctx.set_control_flag("visual_audio_model", audio_model)
+    if audio_voice_present:
+        ctx.set_control_flag("visual_audio_voice", audio_voice)
+    if audio_format_present:
+        ctx.set_control_flag("visual_audio_format", audio_format)
 
-    if attach_probability_raw:
-        try:
-            prob = max(0.0, min(1.0, float(attach_probability_raw)))
-        except ValueError:
-            raise HTTPException(400, "invalid_attach_probability")
-        ctx.set_control_flag("visual_attach_probability", f"{prob:.3f}")
-    else:
-        ctx.set_control_flag("visual_attach_probability", "")
+    if audio_duration_present:
+        if audio_duration_raw:
+            try:
+                dur = max(1, min(300, int(audio_duration_raw)))
+            except ValueError:
+                raise HTTPException(400, "invalid_audio_duration")
+            ctx.set_control_flag("visual_audio_duration", str(dur))
+        else:
+            ctx.set_control_flag("visual_audio_duration", "")
+
+    if audio_instrumental_present:
+        if audio_instrumental_raw:
+            parsed = _to_bool(audio_instrumental_raw, default=False)
+            ctx.set_control_flag("visual_audio_instrumental", "1" if parsed else "0")
+        else:
+            ctx.set_control_flag("visual_audio_instrumental", "")
+
+    if runware_present:
+        if runware_attempts_raw:
+            try:
+                attempts = max(1, min(5, int(runware_attempts_raw)))
+            except ValueError:
+                raise HTTPException(400, "invalid_runware_max_attempts")
+            ctx.set_control_flag("visual_runware_max_attempts", str(attempts))
+        else:
+            ctx.set_control_flag("visual_runware_max_attempts", "")
+
+    if attach_probability_present:
+        if attach_probability_raw:
+            try:
+                prob = max(0.0, min(1.0, float(attach_probability_raw)))
+            except ValueError:
+                raise HTTPException(400, "invalid_attach_probability")
+            ctx.set_control_flag("visual_attach_probability", f"{prob:.3f}")
+        else:
+            ctx.set_control_flag("visual_attach_probability", "")
 
     return {
         "ok": True,
@@ -1773,6 +1944,12 @@ def api_visual_test(
     prompt = str(body.get("prompt", "")).strip()
     mode = str(body.get("mode", "auto")).strip().lower()
     video_provider = str(body.get("video_provider", "")).strip().lower()
+    video_model = str(body.get("video_model", "")).strip()
+    audio_model = str(body.get("audio_model", "")).strip()
+    audio_voice = str(body.get("audio_voice", "")).strip()
+    audio_format = str(body.get("audio_format", "")).strip().lower()
+    audio_duration_raw = str(body.get("audio_duration", "")).strip()
+    audio_instrumental = body.get("audio_instrumental", None)
     phase = str(body.get("phase", "emergence")).strip().lower() or "emergence"
     try:
         day = int(body.get("day", 1))
@@ -1782,12 +1959,27 @@ def api_visual_test(
         raise HTTPException(400, "invalid_mode")
     if video_provider and video_provider not in {"pollinations", "fal"}:
         raise HTTPException(400, "invalid_video_provider")
+    audio_duration: int | None = None
+    if audio_duration_raw:
+        try:
+            audio_duration = max(1, min(300, int(audio_duration_raw)))
+        except ValueError:
+            raise HTTPException(400, "invalid_audio_duration")
+    audio_instrumental_bool: bool | None = None
+    if audio_instrumental is not None:
+        audio_instrumental_bool = _to_bool(audio_instrumental, default=False)
     return ctx.test_visual_generation(
         prompt=prompt or "mu glitch consciousness",
         mode=mode,
         phase=phase,
         day=max(1, day),
         video_provider=video_provider,
+        video_model=video_model,
+        audio_model=audio_model,
+        audio_voice=audio_voice,
+        audio_format=audio_format,
+        audio_duration=audio_duration,
+        audio_instrumental=audio_instrumental_bool,
     )
 
 
@@ -1935,6 +2127,48 @@ async def api_control_force_heartbeat(
         logger.error("Force heartbeat error: %s", exc, exc_info=True)
         raise HTTPException(500, f"heartbeat_error: {exc}")
     return {"ok": True, "summary": summary}
+
+
+# ── Research endpoints ────────────────────────────────────────────
+
+
+@app.post("/api/control/research")
+def api_control_research(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    enabled = _to_bool(body.get("enabled", True), default=True)
+    ctx.set_control_flag("research_enabled", "1" if enabled else "0")
+    return {"ok": True, "control_flags": ctx.get_control_flags()}
+
+
+@app.get("/api/research/sessions")
+def api_research_sessions(
+    limit: int = Query(20, ge=1, le=200),
+    ctx: AdminContext = Depends(verify_auth),
+):
+    if not ctx.db_path.exists():
+        return {"sessions": [], "limit": limit}
+    try:
+        with ctx._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM research_sessions ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    except sqlite3.Error:
+        return {"sessions": [], "limit": limit}
+
+    sessions = []
+    for row in rows:
+        item = dict(row)
+        for json_field in ("urls_visited", "topics"):
+            raw = item.get(json_field, "")
+            if isinstance(raw, str) and raw:
+                try:
+                    item[json_field] = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+        sessions.append(item)
+    return {"sessions": sessions, "limit": limit}
 
 
 # ======================================================================

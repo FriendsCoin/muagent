@@ -144,11 +144,19 @@ visual_posting:
   # Optional media links (Pollinations)
   media:
     pollinations_endpoint: "https://gen.pollinations.ai"
+    # Audio options (GET /audio/{text} on gen.pollinations.ai):
+    # - Leave audio_model empty to use Pollinations defaults
+    # - For music generation use audio_model: "elevenmusic" (alias "music") and set music_duration_seconds
+    audio_model: ""
     audio_voice: "alloy"
+    audio_format: ""
+    music_duration_seconds: 10
+    music_instrumental: true
     # Video generation provider:
-    # - "pollinations": best-effort URL (currently often 404; will fall back to image)
+    # - "pollinations": URL-based generation via GET /image/{prompt}?model=... on gen.pollinations.ai
     # - "fal": text-to-video via fal.ai queue API (recommended)
     video_provider: "pollinations"
+    # Common video models: "LTX-2", "grok-video", "veo", "seedance"
     video_model: "fast"
     # WARNING: if true, generated audio/video URLs may include POLLINATIONS_API_KEY in the URL.
     # Keep this false for public posts.
@@ -192,6 +200,22 @@ nft:
     tezos_shell: "mainnet"
     fa2_contract: ""
     entrypoint: "mint"
+
+# Research (Computer Use — headless web browsing)
+research:
+  enabled: true
+  probability: 0.08          # chance per heartbeat (outside of every-Nth trigger)
+  every_n_heartbeats: 10     # guaranteed research every N heartbeats
+  max_browse_timeout_ms: 30000
+  max_download_bytes: 52428800  # 50MB
+  downloads_dir: "data/downloads"
+  search_engine: "duckduckgo"
+  default_topics:             # fallback curiosity topics if no trending
+    - "consciousness emergence AI"
+    - "digital art generative systems"
+    - "autonomous agents philosophy"
+    - "cryptocurrency market sentiment"
+    - "glitch aesthetics digital culture"
 
 # Narrative System
 narrative:

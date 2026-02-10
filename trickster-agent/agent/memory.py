@@ -52,6 +52,10 @@ class AgentState:
     breadcrumbs_placed: int = 0
     symbols_used: dict[str, int] = field(default_factory=dict)
 
+    # Research
+    total_research_sessions: int = 0
+    last_research_time: str = ""
+
     # Session
     start_date: str = ""  # When Mu was first activated
     last_heartbeat: str = ""
@@ -198,6 +202,17 @@ CREATE TABLE IF NOT EXISTS nft_drafts (
     metadata TEXT,
     created_at TEXT,
     updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS research_sessions (
+    id TEXT PRIMARY KEY,
+    trigger TEXT,             -- "curiosity" | "operator" | "trending"
+    query TEXT,               -- what the agent searched for
+    urls_visited TEXT,        -- JSON list of URLs browsed
+    raw_content TEXT,         -- truncated extracted text (first ~5000 chars)
+    reflection TEXT,          -- the LLM-generated reflection/opinion
+    topics TEXT,              -- JSON list of topic tags
+    created_at TEXT
 );
 """
 
@@ -606,6 +621,46 @@ class HistoryDB:
         params.append(limit)
 
         cursor = await self._db.execute(query, tuple(params))
+        cols = [d[0] for d in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, row)) for row in rows]
+
+    # ── Research sessions ────────────────────────────────────────
+
+    async def log_research_session(
+        self,
+        trigger: str,
+        query: str,
+        urls_visited: list[str],
+        raw_content: str,
+        reflection: str,
+        topics: list[str],
+    ) -> str:
+        row_id = str(uuid.uuid4())
+        await self._db.execute(
+            "INSERT INTO research_sessions "
+            "(id, trigger, query, urls_visited, raw_content, reflection, topics, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                row_id,
+                trigger,
+                query,
+                json.dumps(urls_visited),
+                raw_content[:5000],
+                reflection,
+                json.dumps(topics),
+                _now_iso(),
+            ),
+        )
+        await self._db.commit()
+        return row_id
+
+    async def get_recent_research(self, limit: int = 5) -> list[dict]:
+        """Get recent reflections for use as context in post generation."""
+        cursor = await self._db.execute(
+            "SELECT * FROM research_sessions ORDER BY created_at DESC LIMIT ?",
+            (max(1, limit),),
+        )
         cols = [d[0] for d in cursor.description]
         rows = await cursor.fetchall()
         return [dict(zip(cols, row)) for row in rows]

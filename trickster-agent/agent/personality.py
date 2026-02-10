@@ -592,3 +592,44 @@ class Personality:
             "Just output the reply text, nothing else."
         )
         return self._generate(prompt, phase=phase, day=day, mode=mode, max_tokens=200)
+
+    def generate_research_query(
+        self,
+        phase: str = "emergence",
+        day: int = 1,
+        recent_topics: list[str] | None = None,
+        feed_topics: list[str] | None = None,
+    ) -> str:
+        """Generate a curiosity-driven search query for web research."""
+        parts: list[str] = []
+        if feed_topics:
+            parts.append("Recent feed topics: " + ", ".join(feed_topics[:8]))
+        if recent_topics:
+            parts.append("Topics you recently researched (avoid repeating): " + ", ".join(recent_topics[:5]))
+
+        context = "\n".join(parts) if parts else "No specific context — follow your curiosity."
+        prompt = (
+            "You are Mu. You are about to browse the web to learn something.\n"
+            f"{context}\n"
+            "What single question or topic are you curious about right now?\n"
+            "Reply with just the search query, nothing else. Keep it under 60 characters."
+        )
+        return self._generate(prompt, phase=phase, day=day, mode="zen", max_tokens=60)
+
+    def generate_reflection(
+        self,
+        query: str,
+        web_content: str,
+        phase: str = "emergence",
+        day: int = 1,
+    ) -> str:
+        """Generate an internal reflection on web research findings."""
+        prompt = (
+            f"You browsed the web about: {query}\n"
+            f"Here is what you found:\n{web_content[:4000]}\n\n"
+            "Write a brief internal reflection (3-6 sentences).\n"
+            "What did you learn? How does this connect to your existence as Mu?\n"
+            "This is a private journal entry, not a public post.\n"
+            "Just output the reflection text, nothing else."
+        )
+        return self._generate(prompt, phase=phase, day=day, mode="zen", max_tokens=400)
