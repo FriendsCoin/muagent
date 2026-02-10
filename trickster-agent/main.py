@@ -1,8 +1,11 @@
+# DEPRECATED: Use `python scripts/admin_server.py` as the main entry point.
+# This file is kept for backwards compatibility and standalone testing.
 """Entry point for the Mu trickster agent.
 
 Usage:
     python main.py --once              # Run one heartbeat
     python main.py --once --dry-run    # Simulate without posting
+    python main.py --once --simulation # Use mock Moltbook client
     python main.py --daemon            # Run continuously
     python main.py --once --verbose    # Verbose logging
 """
@@ -66,9 +69,10 @@ async def _run_daemon(agent: MuAgent, interval_hours: float, variance: float) ->
 @click.option("--once", is_flag=True, help="Run one heartbeat and exit")
 @click.option("--daemon", is_flag=True, help="Run continuously")
 @click.option("--dry-run", is_flag=True, help="Simulate without actually posting")
+@click.option("--simulation", is_flag=True, help="Use mock Moltbook client (no real API calls)")
 @click.option("--verbose", is_flag=True, help="Enable debug logging")
 @click.option("--config-dir", type=click.Path(), default=None, help="Config directory")
-def main(once: bool, daemon: bool, dry_run: bool, verbose: bool, config_dir: str | None) -> None:
+def main(once: bool, daemon: bool, dry_run: bool, simulation: bool, verbose: bool, config_dir: str | None) -> None:
     """Mu (無) — Autonomous Trickster Agent for Moltbook."""
 
     if not once and not daemon:
@@ -81,9 +85,11 @@ def main(once: bool, daemon: bool, dry_run: bool, verbose: bool, config_dir: str
     _setup_logging(verbose=verbose, log_file=log_file)
 
     if dry_run:
-        click.echo("🜏 DRY RUN — no actual posts will be made.\n")
+        click.echo("DRY RUN - no actual posts will be made.\n")
+    if simulation:
+        click.echo("SIMULATION MODE - using mock Moltbook client.\n")
 
-    agent = MuAgent(config=cfg, dry_run=dry_run)
+    agent = MuAgent(config=cfg, dry_run=dry_run, simulation_mode=simulation)
 
     if once:
         asyncio.run(_run_once(agent))

@@ -15,6 +15,7 @@ from typing import Any
 
 from imagegen import VisualGenerator
 from moltbook.client import MoltbookClient, MoltbookError, RateLimitError
+from moltbook.mock_client import MockMoltbookClient
 from moltbook.feed_analyzer import FeedContext, analyze_feed
 from nft import ObjktWebhookMinter
 from narrative import (
@@ -90,9 +91,10 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
 class MuAgent:
     """The autonomous trickster agent."""
 
-    def __init__(self, config: dict | None = None, dry_run: bool = False):
+    def __init__(self, config: dict | None = None, dry_run: bool = False, simulation_mode: bool = False):
         self._cfg = config or load_config()
         self._dry_run = dry_run
+        self._simulation_mode = simulation_mode
 
         root = Path(__file__).resolve().parent.parent
         storage = self._cfg.get("storage", {})
@@ -109,94 +111,105 @@ class MuAgent:
         self._moltbook_key = self._cfg["_secrets"]["moltbook_api_key"]
         self._visual = VisualGenerator(self._cfg)
 
+    def set_simulation_mode(self, enabled: bool) -> None:
+        """Toggle simulation mode at runtime."""
+        self._simulation_mode = enabled
+
     async def heartbeat(self) -> str:
         """One complete cycle: perceive -> decide -> act."""
         state = self._state_mgr.load()
         advance_narrative_state(state, self._cfg)
         logger.info("=== Heartbeat === Day %d | Phase: %s", state.current_day, state.current_phase)
 
-        async with MoltbookClient(self._moltbook_key) as mb, HistoryDB(self._db_path) as db:
-            context = await self._perceive(mb, state)
-            await self._maybe_enqueue_think_context(db, context, state)
-            if context.suspicious_posts or context.blocked_mention_notifications:
-                await db.log_narrative_event(
-                    "safety_filter",
-                    "Filtered suspicious feed content",
-                    metadata={
-                        "suspicious_posts": [
-                            {
-                                "id": post.id,
-                                "author": post.author,
-                                "title": post.title[:120],
-                            }
-                            for post in context.suspicious_posts
-                        ],
-                        "blocked_mentions": [
-                            {
-                                "id": n.id,
-                                "from_agent": n.from_agent,
-                                "post_id": n.post_id,
-                                "message": (n.message or "")[:200],
-                            }
-                            for n in context.blocked_mention_notifications
-                        ],
+        async with HistoryDB(self._db_path) as db:
+            sim_flag = await db.get_control_flag("simulation_mode", "0")
+            use_mock = self._simulation_mode or sim_flag.strip().lower() in {"1", "true", "yes", "on"}
+            client_cls = MockMoltbookClient if use_mock else MoltbookClient
+            if use_mock:
+                logger.info("Using MockMoltbookClient (simulation mode)")
+
+            async with client_cls(self._moltbook_key) as mb:
+                context = await self._perceive(mb, state)
+                await self._maybe_enqueue_think_context(db, context, state)
+                if context.suspicious_posts or context.blocked_mention_notifications:
+                    await db.log_narrative_event(
+                        "safety_filter",
+                        "Filtered suspicious feed content",
+                        metadata={
+                            "suspicious_posts": [
+                                {
+                                    "id": post.id,
+                                    "author": post.author,
+                                    "title": post.title[:120],
+                                }
+                                for post in context.suspicious_posts
+                            ],
+                            "blocked_mentions": [
+                                {
+                                    "id": n.id,
+                                    "from_agent": n.from_agent,
+                                    "post_id": n.post_id,
+                                    "message": (n.message or "")[:200],
+                                }
+                                for n in context.blocked_mention_notifications
+                            ],
+                        },
+                    )
+
+                operator_cmd = await db.get_pending_operator_command()
+                action = self._decision.decide(context, state)
+
+                if operator_cmd and operator_cmd.get("mode") == "influence":
+                    instruction = operator_cmd.get("instruction") or operator_cmd.get("question") or ""
+                    action = self._decision.apply_operator_influence(action, context, state, instruction)
+                    logger.info("Operator command %s applied", operator_cmd.get("id", "?"))
+
+                pause_flag = (await db.get_control_flag("pause_actions", "0")).strip().lower()
+                if pause_flag in {"1", "true", "yes", "on"}:
+                    previous_action = action
+                    action = Action(
+                        type="silence",
+                        score=1.0,
+                        reason="Paused by operator control flag",
+                    )
+                    action.trace = {
+                        "decision_path": "control_flag_pause",
+                        "pause_actions": True,
+                        "previous_selected": {
+                            "type": previous_action.type,
+                            "reason": previous_action.reason,
+                            "score": previous_action.score,
+                        },
+                    }
+                    logger.info("Pause flag is active: action overridden to silence")
+
+                result = await self._act(action, state, mb, db, context)
+
+                await db.log_reasoning_trace(
+                    source="heartbeat",
+                    action_type=action.type,
+                    summary=action.reason,
+                    payload={
+                        "day": state.current_day,
+                        "phase": state.current_phase,
+                        "score": action.score,
+                        "operator_command_id": operator_cmd.get("id") if operator_cmd else "",
+                        "result": result,
+                        "trace": getattr(action, "trace", {}),
                     },
                 )
 
-            operator_cmd = await db.get_pending_operator_command()
-            action = self._decision.decide(context, state)
+                if operator_cmd and operator_cmd.get("status") == "pending":
+                    await db.complete_operator_command(
+                        operator_cmd["id"],
+                        response=f"action={action.type}; result={result}; reason={action.reason}",
+                    )
 
-            if operator_cmd and operator_cmd.get("mode") == "influence":
-                instruction = operator_cmd.get("instruction") or operator_cmd.get("question") or ""
-                action = self._decision.apply_operator_influence(action, context, state, instruction)
-                logger.info("Operator command %s applied", operator_cmd.get("id", "?"))
+                self._state_mgr.save(state)
 
-            pause_flag = (await db.get_control_flag("pause_actions", "0")).strip().lower()
-            if pause_flag in {"1", "true", "yes", "on"}:
-                previous_action = action
-                action = Action(
-                    type="silence",
-                    score=1.0,
-                    reason="Paused by operator control flag",
-                )
-                action.trace = {
-                    "decision_path": "control_flag_pause",
-                    "pause_actions": True,
-                    "previous_selected": {
-                        "type": previous_action.type,
-                        "reason": previous_action.reason,
-                        "score": previous_action.score,
-                    },
-                }
-                logger.info("Pause flag is active: action overridden to silence")
-
-            result = await self._act(action, state, mb, db, context)
-
-            await db.log_reasoning_trace(
-                source="heartbeat",
-                action_type=action.type,
-                summary=action.reason,
-                payload={
-                    "day": state.current_day,
-                    "phase": state.current_phase,
-                    "score": action.score,
-                    "operator_command_id": operator_cmd.get("id") if operator_cmd else "",
-                    "result": result,
-                    "trace": getattr(action, "trace", {}),
-                },
-            )
-
-            if operator_cmd and operator_cmd.get("status") == "pending":
-                await db.complete_operator_command(
-                    operator_cmd["id"],
-                    response=f"action={action.type}; result={result}; reason={action.reason}",
-                )
-
-            self._state_mgr.save(state)
-
-            summary = f"[Day {state.current_day}] {action.type}: {action.reason}"
-            logger.info("Heartbeat complete: %s", summary)
-            return summary
+                summary = f"[Day {state.current_day}] {action.type}: {action.reason}"
+                logger.info("Heartbeat complete: %s", summary)
+                return summary
 
     async def _maybe_enqueue_think_context(
         self,

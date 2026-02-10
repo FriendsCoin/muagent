@@ -41,7 +41,10 @@ import click
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import random
+
 from agent.config import load_config
+from agent.core import MuAgent
 from agent.personality import Personality
 from imagegen import VisualGenerator
 from moltbook.client import MoltbookClient, MoltbookError
@@ -245,6 +248,9 @@ class AdminContext:
     framework_dir: Path
     _personality: Personality | None = None
     started_unix: float = field(default_factory=time.time)
+    agent: MuAgent | None = None
+    _heartbeat_task: asyncio.Task | None = None
+    _loop_running: bool = False
 
     def __post_init__(self) -> None:
         self.framework = load_conscious_framework(self.framework_dir)
@@ -1397,6 +1403,30 @@ class AdminContext:
         return asyncio.run(self._delete_post_async(post_id))
 
 
+# ── Background heartbeat loop ────────────────────────────────────
+
+
+async def _heartbeat_loop(ctx: AdminContext) -> None:
+    """Background heartbeat that runs at configured interval."""
+    cfg = ctx.cfg
+    interval = cfg.get("agent", {}).get("check_interval_hours", 4)
+    variance = cfg.get("agent", {}).get("check_interval_variance", 0.5)
+    while ctx._loop_running:
+        try:
+            summary = await ctx.agent.heartbeat()
+            logger.info("Background heartbeat: %s", summary)
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            logger.error("Background heartbeat error: %s", exc, exc_info=True)
+        sleep_hours = interval + random.uniform(-variance, variance)
+        sleep_seconds = max(60, sleep_hours * 3600)
+        try:
+            await asyncio.sleep(sleep_seconds)
+        except asyncio.CancelledError:
+            break
+
+
 # ======================================================================
 # FastAPI Application (replaces AdminHandler)
 # ======================================================================
@@ -1454,11 +1484,30 @@ def index():
 def api_status(ctx: AdminContext = Depends(verify_auth)):
     state = ctx.load_state()
     counts = ctx.fetch_counts()
+    flags = ctx.get_control_flags()
+
+    # Determine simulation mode from DB flag
+    sim_raw = str(flags.get("simulation_mode", "0")).strip().lower()
+    simulation_mode = sim_raw in {"1", "true", "yes", "on"}
+
+    # Agent state label
+    loop_running = ctx._loop_running and ctx._heartbeat_task is not None and not ctx._heartbeat_task.done()
+    if loop_running and ctx._heartbeat_task is not None and not ctx._heartbeat_task.done():
+        # Check if heartbeat is actively executing (rough heuristic)
+        agent_state_label = "Sleeping"  # loop is running but between heartbeats
+    elif not loop_running:
+        agent_state_label = "Offline"
+    else:
+        agent_state_label = "Sleeping"
+
     return {
         "state": state,
         "counts": counts,
         "post_activity": ctx.fetch_post_activity(),
-        "control_flags": ctx.get_control_flags(),
+        "control_flags": flags,
+        "simulation_mode": simulation_mode,
+        "loop_running": loop_running,
+        "agent_state": agent_state_label,
         "conscious_framework": {
             "dir": str(ctx.framework_dir),
             "available": ctx.framework.available,
@@ -1823,6 +1872,71 @@ def api_control_delete_post(
     return {"ok": True, "deleted": deleted}
 
 
+# ── Simulation & Heartbeat Loop endpoints ────────────────────────
+
+
+@app.post("/api/control/toggle_simulation")
+def api_control_toggle_simulation(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    enabled = _to_bool(body.get("enabled", False), default=False)
+    ctx.set_control_flag("simulation_mode", "1" if enabled else "0")
+    if ctx.agent:
+        ctx.agent.set_simulation_mode(enabled)
+    flags = ctx.get_control_flags()
+    return {
+        "ok": True,
+        "simulation_mode": enabled,
+        "control_flags": flags,
+    }
+
+
+@app.post("/api/control/loop")
+async def api_control_loop(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    action = str(body.get("action", "")).strip().lower()
+    if action not in {"start", "stop"}:
+        raise HTTPException(400, "action must be 'start' or 'stop'")
+
+    if ctx.agent is None:
+        raise HTTPException(500, "MuAgent not initialized")
+
+    if action == "start":
+        if ctx._loop_running and ctx._heartbeat_task and not ctx._heartbeat_task.done():
+            return {"ok": True, "loop_running": True, "message": "already_running"}
+        ctx._loop_running = True
+        ctx._heartbeat_task = asyncio.create_task(_heartbeat_loop(ctx))
+        logger.info("Heartbeat loop started")
+        return {"ok": True, "loop_running": True, "message": "started"}
+
+    # stop
+    ctx._loop_running = False
+    if ctx._heartbeat_task and not ctx._heartbeat_task.done():
+        ctx._heartbeat_task.cancel()
+        try:
+            await ctx._heartbeat_task
+        except asyncio.CancelledError:
+            pass
+    ctx._heartbeat_task = None
+    logger.info("Heartbeat loop stopped")
+    return {"ok": True, "loop_running": False, "message": "stopped"}
+
+
+@app.post("/api/control/force_heartbeat")
+async def api_control_force_heartbeat(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    if ctx.agent is None:
+        raise HTTPException(500, "MuAgent not initialized")
+    try:
+        summary = await ctx.agent.heartbeat()
+    except Exception as exc:
+        logger.error("Force heartbeat error: %s", exc, exc_info=True)
+        raise HTTPException(500, f"heartbeat_error: {exc}")
+    return {"ok": True, "summary": summary}
+
+
 # ======================================================================
 # CLI Entry Point
 # ======================================================================
@@ -1849,6 +1963,9 @@ def main(host: str, port: int, config_dir: str | None, admin_token: str, conscio
     token = admin_token.strip() or cfg.get("_secrets", {}).get("admin_token", "") or ""
     fw_dir = Path(conscious_dir) if conscious_dir else (root / "NEW" / "conscious-claude-master")
 
+    # Initialize MuAgent (the in-process heartbeat engine)
+    agent = MuAgent(config=cfg)
+
     _ctx = AdminContext(
         cfg=cfg,
         project_root=root,
@@ -1857,10 +1974,12 @@ def main(host: str, port: int, config_dir: str | None, admin_token: str, conscio
         log_path=log_path,
         admin_token=token,
         framework_dir=fw_dir,
+        agent=agent,
     )
 
     click.echo(f"Mu admin API (FastAPI) listening on http://{host}:{port}")
     click.echo(f"CORS enabled for all origins")
+    click.echo("MuAgent initialized (heartbeat loop inactive until POST /api/control/loop)")
     if token:
         click.echo("Admin token enabled (token query param or X-Admin-Token header).")
     click.echo(f"Conscious framework dir: {fw_dir}")
