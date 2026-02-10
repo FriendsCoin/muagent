@@ -162,10 +162,20 @@ class MuAgent:
                         },
                     )
 
-                research_flag = await db.get_control_flag("research_enabled", "1")
+                # Research toggles:
+                # - config.settings.yaml -> research.enabled (defaults for new installs)
+                # - control_flags.research_enabled (runtime kill switch)
+                # - control_flags.research_mode: "server" | "local"
+                #
+                # Important: do NOT AND with the previous in-memory value here, or a temporary disable
+                # would permanently stick until process restart.
+                research_cfg_enabled = bool((self._cfg.get("research") or {}).get("enabled", False))
+                research_flag = (await db.get_control_flag("research_enabled", "1")).strip().lower()
+                research_mode = (await db.get_control_flag("research_mode", "server")).strip().lower()
+                research_enabled_flag = research_flag not in {"0", "false", "no", "off"}
+                research_mode_server = research_mode in {"", "server", "vps", "remote"}
                 self._decision._research_enabled = (
-                    self._decision._research_enabled
-                    and research_flag.strip().lower() not in {"0", "false", "no", "off"}
+                    research_cfg_enabled and research_enabled_flag and research_mode_server
                 )
 
                 operator_cmd = await db.get_pending_operator_command()

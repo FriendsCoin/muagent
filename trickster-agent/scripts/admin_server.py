@@ -2138,6 +2138,11 @@ def api_control_research(
 ):
     enabled = _to_bool(body.get("enabled", True), default=True)
     ctx.set_control_flag("research_enabled", "1" if enabled else "0")
+    mode = str(body.get("mode", "") or "").strip().lower()
+    if mode:
+        if mode not in {"server", "local"}:
+            raise HTTPException(status_code=400, detail="invalid_mode")
+        ctx.set_control_flag("research_mode", mode)
     return {"ok": True, "control_flags": ctx.get_control_flags()}
 
 
@@ -2169,6 +2174,54 @@ def api_research_sessions(
                     pass
         sessions.append(item)
     return {"sessions": sessions, "limit": limit}
+
+
+@app.post("/api/research/submit")
+def api_research_submit(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    """Submit a research session from an external runner (e.g., local Playwright)."""
+    query = str(body.get("query", "") or "").strip()
+    reflection = str(body.get("reflection", "") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="missing_query")
+    if not reflection:
+        raise HTTPException(status_code=400, detail="missing_reflection")
+
+    trigger = str(body.get("trigger", "") or "").strip() or "operator_local"
+    raw_content = str(body.get("raw_content", "") or "")
+
+    urls_visited = body.get("urls_visited", [])
+    if not isinstance(urls_visited, list):
+        raise HTTPException(status_code=400, detail="invalid_urls_visited")
+    urls_visited = [str(u) for u in urls_visited if u]
+
+    topics = body.get("topics", [])
+    if not isinstance(topics, list):
+        raise HTTPException(status_code=400, detail="invalid_topics")
+    topics = [str(t) for t in topics if t]
+
+    item_id = str(uuid.uuid4())
+    created_at = _now_iso()
+
+    with ctx._connect() as conn:
+        conn.execute(
+            "INSERT INTO research_sessions (id, trigger, query, urls_visited, raw_content, reflection, topics, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                item_id,
+                trigger[:80],
+                query[:400],
+                json.dumps(urls_visited, ensure_ascii=False),
+                raw_content[:5000],
+                reflection[:5000],
+                json.dumps(topics, ensure_ascii=False),
+                created_at,
+            ),
+        )
+        conn.commit()
+
+    return {"ok": True, "id": item_id, "created_at": created_at}
 
 
 # ======================================================================
