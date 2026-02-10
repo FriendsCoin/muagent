@@ -17,15 +17,31 @@ param(
   [string] $AppDir = "/opt/trickster-agent/repo/trickster-agent",
   [string] $AppUser = "bot",
   [Parameter(Mandatory=$true)][string] $KeyName,
-  [Parameter(Mandatory=$true)][string] $KeyValue
+  [string] $KeyValue = "",
+  [switch] $Prompt
 )
 
 if ($KeyName -notmatch '^[A-Z0-9_]+$') {
   throw "Invalid KeyName: $KeyName"
 }
 
+function ConvertFrom-SecureStringPlain {
+  param([Parameter(Mandatory=$true)][System.Security.SecureString] $Secure)
+  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+  try {
+    return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+  } finally {
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+  }
+}
+
+if ($Prompt -or [string]::IsNullOrWhiteSpace($KeyValue)) {
+  $sec = Read-Host -AsSecureString -Prompt "Enter value for $KeyName"
+  $KeyValue = ConvertFrom-SecureStringPlain -Secure $sec
+}
+
 if ([string]::IsNullOrWhiteSpace($KeyValue)) {
-  throw "KeyValue is empty"
+  throw "KeyValue is empty (use -KeyValue or -Prompt)"
 }
 
 # Send a small bash runner via base64 to avoid quoting issues.
