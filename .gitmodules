@@ -1,0 +1,3 @@
+[submodule "trickster-command"]
+	path = trickster-command
+	url = https://github.com/FriendsCoin/trickster-command.git

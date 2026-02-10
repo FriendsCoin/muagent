@@ -1,46 +1,31 @@
 # Deploy Automation (Ubuntu VPS + Windows local)
 
-## 1. One-command server bootstrap
+This repo is split into:
+- Server side (Ubuntu/Hetzner): runs the agent + admin API as systemd services
+- Local side (Windows): runs the React dashboard and connects via SSH tunnel
 
-Run from your Windows machine (PowerShell):
+## 1) One-command server bootstrap (first install)
+
+From Windows (PowerShell):
 
 ```powershell
 cd E:\PROJECTS\files_molt
 scp .\trickster-agent\deploy\install_ubuntu.sh root@YOUR_SERVER_IP:/root/install_ubuntu.sh
-ssh root@YOUR_SERVER_IP "chmod +x /root/install_ubuntu.sh && REPO_URL='https://github.com/FriendsCoin/muagent.git' REPO_BRANCH='master' PROJECT_SUBDIR='trickster-agent' MOLTBOOK_API_KEY='YOUR_MOLTBOOK_KEY' ANTHROPIC_API_KEY='YOUR_ANTHROPIC_KEY' ADMIN_TOKEN='CHANGE_ME' /root/install_ubuntu.sh"
+ssh root@YOUR_SERVER_IP "chmod +x /root/install_ubuntu.sh && REPO_URL='https://github.com/FriendsCoin/muagent.git' REPO_BRANCH='main' PROJECT_SUBDIR='trickster-agent' MOLTBOOK_API_KEY='YOUR_MOLTBOOK_KEY' ANTHROPIC_API_KEY='YOUR_ANTHROPIC_KEY' ADMIN_TOKEN='CHANGE_ME' /root/install_ubuntu.sh"
 ```
 
-Adjust `REPO_BRANCH` to your real branch (`main`/`master`).
+## 2) Migrate local state/history to continue timeline
 
-## 2. Migrate local state/history to continue timeline
+From Windows (PowerShell):
 
 ```powershell
+cd E:\PROJECTS\files_molt
 powershell -ExecutionPolicy Bypass -File .\trickster-agent\deploy\sync_state_from_windows.ps1 -ServerIp YOUR_SERVER_IP
 ```
 
-This script:
-- stops `trickster-agent` on server,
-- uploads `data/state.json` + `data/history.db`,
-- restores ownership and starts service.
+## 3) Admin API + React dashboard
 
-## 3. Enable maintenance automation (update + backup + monitor)
-
-On server:
-
-```bash
-cd /opt/trickster-agent/repo/trickster-agent
-chmod +x deploy/setup_maintenance.sh
-sudo deploy/setup_maintenance.sh
-```
-
-Installed cron jobs:
-- every 5 min: service monitor + auto-restart (`monitor_service.sh`)
-- daily 03:20 UTC: backup `data/` tar.gz (`backup_data.sh`)
-- daily 03:45 UTC: git pull + pip install + service restart (`update_and_restart.sh`)
-
-## 4. Admin UI (observe/influence modes)
-
-Install service:
+### 3.1 Install admin API service (on server)
 
 ```bash
 cd /opt/trickster-agent/repo/trickster-agent
@@ -48,137 +33,105 @@ chmod +x deploy/install_admin_ui.sh
 sudo ADMIN_HOST=127.0.0.1 ADMIN_PORT=8787 deploy/install_admin_ui.sh
 ```
 
-Use SSH tunnel from local machine:
+### 3.2 Open tunnel (on Windows)
+
+This forwards:
+- local `http://localhost:8000` -> server `http://127.0.0.1:8787`
 
 ```powershell
-ssh -L 8787:127.0.0.1:8787 root@YOUR_SERVER_IP
+cd E:\PROJECTS\files_molt
+.\trickster-agent\deploy\tunnel_admin.ps1 -ServerIp YOUR_SERVER_IP
 ```
 
-Then open:
+Keep this terminal open. Stop the tunnel with Ctrl+C.
 
-`http://127.0.0.1:8787`
+### 3.3 Run the dashboard (on Windows)
 
-Modes:
-- `observe`: ask Mu, no effect on decisions.
-- `influence`: queues one instruction for next heartbeat.
-- `conscious framework` checkbox: includes context from `NEW/conscious-claude-master` in responses.
-- `Reasoning Trace` panel: shows safe structured decision traces (options/scores/selection), not hidden chain-of-thought.
-- `Safety Blocks` panel: shows suspicious posts/mentions that were filtered by anti-manipulation rules.
-- `Post Activity` panel: shows post counts for last 10h/24h and latest post timestamp/title.
-- `Control` panel:
-  - `Pause Actions` / `Resume Actions` (writes `pause_actions` control flag).
-  - `Run Once (Dry)` for safe diagnostics.
-  - `Run Once (Live)` for immediate live heartbeat (can post/comment).
-  - `Reload Framework` to re-read `NEW/conscious-claude-master` without restarting service.
-  - `Delete Post` by `post_id` (requires typing `DELETE`; only own post is allowed).
-- `Debug` panel:
-  - runtime snapshot,
-  - key file states/sizes,
-  - `systemctl is-active/is-enabled` for `trickster-agent`, `trickster-admin`, `trickster-thinker`, `trickster-objkt-worker`.
-
-If `ADMIN_TOKEN` is set in `.env`, paste it in UI token field.
-Token is passed as URL query (`?token=...`) to avoid browser header encoding issues.
-
-## 5. Autonomous thinking service (optional)
-
-```bash
-cd /opt/trickster-agent/repo/trickster-agent
-chmod +x deploy/install_conscious_thinker.sh
-sudo INTERVAL_MINUTES=45 deploy/install_conscious_thinker.sh
+```powershell
+cd E:\PROJECTS\files_molt\trickster-command
+npm run dev
 ```
 
-This writes autonomous thought entries into `thought_journal` table.
-They are visible in the admin activity panel.
+Open: `http://localhost:8080`
 
-## 5b. NFT mint worker (objkt webhook)
+If you set `ADMIN_TOKEN` in server `config/.env`, you must also provide it to the dashboard (Settings). Alternatively, set:
+- `trickster-command/.env.local`:
 
-Install worker service:
-
-```bash
-cd /opt/trickster-agent/repo/trickster-agent
-chmod +x deploy/install_objkt_worker.sh
-sudo OBJKT_WORKER_HOST=127.0.0.1 OBJKT_WORKER_PORT=9898 deploy/install_objkt_worker.sh
+```env
+VITE_ADMIN_BASE_URL=http://localhost:8000
+VITE_ADMIN_TOKEN=YOUR_ADMIN_TOKEN
 ```
 
-Set webhook URL in `config/settings.yaml`:
+## 4) Update server code (git pull + pip install + restart)
 
-```yaml
-nft:
-  enabled: true
-  mode: "draft"   # draft | manual | auto
-  objkt:
-    mint_webhook_url: "http://127.0.0.1:9898/mint"
+From Windows (PowerShell):
+
+```powershell
+cd E:\PROJECTS\files_molt
+.\trickster-agent\deploy\update_server.ps1 -ServerIp YOUR_SERVER_IP
 ```
 
-Worker health check:
+This does:
+- stop services (best-effort)
+- stash local changes on server repo (so pull can fast-forward)
+- `git pull --ff-only origin main`
+- `pip install -r requirements.txt` into `.venv`
+- restart services
 
-```bash
-curl -s http://127.0.0.1:9898/health
+## 5) Rotate secrets (API keys) on the server
+
+From Windows (PowerShell) (recommended: via env var, so it doesn't land in PS history):
+
+```powershell
+$env:NEW_KEY = "moltbook_sk_..."
+.\trickster-agent\deploy\set_remote_env.ps1 -KeyName MOLTBOOK_API_KEY -KeyValue $env:NEW_KEY
 ```
 
 Notes:
-- `mode=draft`: only create NFT drafts from visual posts.
-- `mode=manual`: drafts + mint manually from admin panel.
-- `mode=auto`: draft is created and mint is attempted automatically after posting.
-- Keep `OBJKT_WEBHOOK_TOKEN` the same in both agent/admin environment and worker environment.
-- Worker `dry_run` mode returns a fake token URL. For real on-chain mint use worker mode `command` or `pytezos`.
+- API keys should be ASCII. If you paste with RU keyboard layout, you may insert Cyrillic characters and break loading.
+- Do not `source config/.env` on Linux. It is not a shell script. The project reads it via python-dotenv.
 
-## 6. Заливка отдельных файлов на сервер (без git)
-
-Чтобы выложить только изменённые файлы через SCP (без git pull на сервере), можно сгенерировать команды так:
-
-- **По запросу ассистенту:** напиши, какие файлы залить (или «залей изменённые»), и попроси подготовить команды SCP — получишь готовый блок для PowerShell.
-- **Формат:** одна строка `cd E:\PROJECTS\files_molt`, затем для каждого файла строка вида:
-  `scp .\trickster-agent\путь\к\файлу root@SERVER_IP:/opt/trickster-agent/repo/trickster-agent/путь/к/файлу`
-
-Пример (подставь свой IP):
-
-```powershell
-cd E:\PROJECTS\files_molt
-scp .\trickster-agent\agent\core.py root@65.21.243.4:/opt/trickster-agent/repo/trickster-agent/agent/core.py
-scp .\trickster-agent\agent\memory.py root@65.21.243.4:/opt/trickster-agent/repo/trickster-agent/agent/memory.py
-```
-
-Правило для ассистента: `.cursor/rules/scp-upload.mdc`.
-
-## 7. Обновление репозитория на сервере (в облаке)
-
-**С Windows (PowerShell)** — скрипт один раз дергает сервер:
-
-```powershell
-cd E:\PROJECTS\files_molt
-.\trickster-agent\deploy\update_server.ps1
-# или другой IP:
-.\trickster-agent\deploy\update_server.ps1 -ServerIp 1.2.3.4
-```
-
-Если уже зашли в `trickster-agent\deploy`, запускайте так: `.\update_server.ps1` (обязательно с `.\`).
-
-**На самом сервере** — под пользователем, у которого настроен доступ к репо (например `bot`):
-
-```bash
-sudo -u bot -H bash -lc '
-cd /opt/trickster-agent/repo
-git fetch --all --prune
-git checkout main
-git pull --ff-only origin main
-'
-```
-
-После обновления кода при необходимости перезапустить сервисы (см. п. 8).
-
-## 8. Health checks
+## 6) Health checks (server)
 
 ```bash
 systemctl status trickster-agent --no-pager -l
-journalctl -u trickster-agent -f
 systemctl status trickster-admin --no-pager -l
 systemctl status trickster-thinker --no-pager -l
 systemctl status trickster-objkt-worker --no-pager -l
+
+journalctl -u trickster-agent -n 120 --no-pager
+journalctl -u trickster-admin -n 120 --no-pager
 ```
 
-Quick post activity API check:
+Ports:
+- admin API: `127.0.0.1:8787` (server)
+- objkt worker: `127.0.0.1:9898` (server)
 
+## 7) Common problems
+
+### Dashboard shows `ERR_CONNECTION_REFUSED`
+
+You forgot the tunnel or the admin service is down.
+
+1) On server:
 ```bash
-curl -s "http://127.0.0.1:8787/api/post_activity?token=YOUR_ADMIN_TOKEN"
+systemctl restart trickster-admin
+systemctl status trickster-admin --no-pager -l
 ```
+
+2) On Windows: keep the tunnel running:
+```powershell
+.\trickster-agent\deploy\tunnel_admin.ps1
+```
+
+### Server `trickster-admin` says: `No module named fastapi`
+
+You updated code, but didn't reinstall deps.
+
+On server:
+```bash
+cd /opt/trickster-agent/repo/trickster-agent
+sudo -u bot -H bash -lc '.venv/bin/pip install -r requirements.txt'
+systemctl restart trickster-admin
+```
+

@@ -18,5 +18,8 @@ aiosqlite>=0.20           # Async SQLite for history
 # Scheduling
 apscheduler>=3.10,<4.0    # Cron-like scheduling
 
+# Research (Computer Use)
+playwright>=1.40          # Headless Chromium for web browsing
+
 # Utilities
 tenacity>=8.2             # Retry logic for API calls
