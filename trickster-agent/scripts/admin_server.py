@@ -586,6 +586,15 @@ class AdminContext:
                 audio_instrumental = True
             elif audio_instrumental_raw in {"0", "false", "no", "off"}:
                 audio_instrumental = False
+        video_include_audio_raw = str(flags.get("visual_video_include_audio", "")).strip().lower()
+        video_include_audio: bool | None = None
+        if video_include_audio_raw:
+            if video_include_audio_raw in {"1", "true", "yes", "on"}:
+                video_include_audio = True
+            elif video_include_audio_raw in {"0", "false", "no", "off"}:
+                video_include_audio = False
+        if video_include_audio is None:
+            video_include_audio = bool(self.cfg.get("visual_posting", {}).get("media", {}).get("video_include_audio", False))
 
         attempts_raw = str(flags.get("visual_runware_max_attempts", "")).strip()
         attempts = None
@@ -616,6 +625,7 @@ class AdminContext:
             "audio_format": audio_format,
             "audio_duration": audio_duration,
             "audio_instrumental": audio_instrumental,
+            "video_include_audio": video_include_audio,
             "runware_max_attempts_override": attempts,
             "attach_probability_override": prob,
         }
@@ -853,9 +863,12 @@ class AdminContext:
         audio_format: str = "",
         audio_duration: int | None = None,
         audio_instrumental: bool | None = None,
+        include_audio: bool | None = None,
     ) -> dict[str, Any]:
         generator = VisualGenerator(self.cfg)
         if mode in {"audio", "video"}:
+            if include_audio is None:
+                include_audio = mode == "audio"
             return self.test_media_narration(
                 prompt=prompt,
                 mode=mode,
@@ -868,6 +881,7 @@ class AdminContext:
                 audio_format=audio_format,
                 audio_duration=audio_duration,
                 audio_instrumental=audio_instrumental,
+                include_audio=include_audio,
             )
 
         force_mode = mode if mode in {"url", "ascii"} else ""
@@ -931,8 +945,9 @@ class AdminContext:
         audio_format: str = "",
         audio_duration: int | None = None,
         audio_instrumental: bool | None = None,
+        include_audio: bool = True,
     ) -> dict[str, Any]:
-        """Generate an image/video + narrated audio (TTS) instead of reading the prompt verbatim."""
+        """Generate visual media and optional narrated audio."""
         generator = VisualGenerator(self.cfg)
         effective = self._visual_effective_flags()
         vp = str(video_provider or effective.get("video_provider") or "").strip().lower()
@@ -1013,28 +1028,39 @@ class AdminContext:
             except Exception:
                 image_bytes = None
 
-        narration = self.personality().generate_media_narration(
-            visual_prompt=base_visual.prompt or prompt,
-            phase=phase or "emergence",
-            day=max(1, int(day)),
-            image_bytes=image_bytes,
-            image_media_type=image_media_type,
-        )
-        audio = generator.tts_from_text(
-            narration,
-            voice_override=audio_voice or str(effective.get("audio_voice") or ""),
-            model_override=audio_model or str(effective.get("audio_model") or ""),
-            format_override=audio_format or str(effective.get("audio_format") or ""),
-            duration_override=audio_duration if audio_duration is not None else effective.get("audio_duration"),
-            instrumental_override=(
-                audio_instrumental if audio_instrumental is not None else effective.get("audio_instrumental")
-            ),
-        )
+        narration = ""
+        audio_payload: dict[str, Any] | None = None
+        if include_audio:
+            narration = self.personality().generate_media_narration(
+                visual_prompt=base_visual.prompt or prompt,
+                phase=phase or "emergence",
+                day=max(1, int(day)),
+                image_bytes=image_bytes,
+                image_media_type=image_media_type,
+            )
+            audio = generator.tts_from_text(
+                narration,
+                voice_override=audio_voice or str(effective.get("audio_voice") or ""),
+                model_override=audio_model or str(effective.get("audio_model") or ""),
+                format_override=audio_format or str(effective.get("audio_format") or ""),
+                duration_override=audio_duration if audio_duration is not None else effective.get("audio_duration"),
+                instrumental_override=(
+                    audio_instrumental if audio_instrumental is not None else effective.get("audio_instrumental")
+                ),
+            )
+            audio_payload = {
+                "kind": audio.kind,
+                "provider": audio.provider,
+                "prompt": audio.prompt,
+                "url": audio.url,
+                "meta": audio.meta,
+            }
 
         return {
             "mode": mode,
             "phase": phase,
             "day": day,
+            "include_audio": bool(include_audio),
             "base_visual": {
                 "kind": base_visual.kind,
                 "provider": base_visual.provider,
@@ -1043,13 +1069,7 @@ class AdminContext:
                 "meta": base_visual.meta,
             },
             "narration": narration,
-            "audio": {
-                "kind": audio.kind,
-                "provider": audio.provider,
-                "prompt": audio.prompt,
-                "url": audio.url,
-                "meta": audio.meta,
-            },
+            "audio": audio_payload,
         }
 
     def _nft_effective_flags(self) -> dict[str, Any]:
@@ -1795,6 +1815,27 @@ def api_control_moltbook(
     return {"ok": True, "control_flags": ctx.get_control_flags()}
 
 
+@app.post("/api/control/quiet")
+def api_control_quiet(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    enabled = _to_bool(body.get("enabled", True), default=True)
+    cooldown_present = "comment_cooldown_hours" in body
+    cooldown_raw = str(body.get("comment_cooldown_hours", "")).strip()
+
+    ctx.set_control_flag("quiet_mode", "1" if enabled else "0")
+    if cooldown_present:
+        if cooldown_raw:
+            try:
+                cooldown = max(1.0, min(48.0, float(cooldown_raw)))
+            except ValueError:
+                raise HTTPException(400, "invalid_comment_cooldown_hours")
+            ctx.set_control_flag("quiet_comment_cooldown_hours", f"{cooldown:.1f}")
+        else:
+            ctx.set_control_flag("quiet_comment_cooldown_hours", "")
+    return {"ok": True, "control_flags": ctx.get_control_flags()}
+
+
 @app.post("/api/control/reload_framework")
 def api_control_reload_framework(
     body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
@@ -1834,6 +1875,7 @@ def api_control_visual(
     image_model_present = "image_model" in body
     fallback_present = "fallback_provider" in body
     video_provider_present = "video_provider" in body
+    video_include_audio_present = "video_include_audio" in body
     runware_present = "runware_max_attempts" in body
     attach_probability_present = "attach_probability" in body
     video_model_present = "video_model" in body
@@ -1849,6 +1891,7 @@ def api_control_visual(
     image_model = str(body.get("image_model", "")).strip()
     fallback_provider = str(body.get("fallback_provider", "")).strip().lower()
     video_provider = str(body.get("video_provider", "")).strip().lower()
+    video_include_audio_raw = str(body.get("video_include_audio", "")).strip()
     video_model = str(body.get("video_model", "")).strip()
     audio_model = str(body.get("audio_model", "")).strip()
     audio_voice = str(body.get("audio_voice", "")).strip()
@@ -1883,6 +1926,12 @@ def api_control_visual(
         ctx.set_control_flag("visual_fallback_provider", fallback_provider)
     if video_provider_present:
         ctx.set_control_flag("visual_video_provider", video_provider)
+    if video_include_audio_present:
+        if video_include_audio_raw:
+            video_include_audio = _to_bool(video_include_audio_raw, default=False)
+            ctx.set_control_flag("visual_video_include_audio", "1" if video_include_audio else "0")
+        else:
+            ctx.set_control_flag("visual_video_include_audio", "")
 
     if video_model_present:
         ctx.set_control_flag("visual_video_model", video_model)
@@ -1937,6 +1986,51 @@ def api_control_visual(
     }
 
 
+@app.post("/api/control/visual_preset")
+def api_control_visual_preset(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    preset = str(body.get("preset", "")).strip().lower()
+    if preset not in {"image-first", "video-first", "safe-fallback"}:
+        raise HTTPException(400, "invalid_preset")
+
+    # Common defaults for safe operation.
+    ctx.set_control_flag("visual_enabled", "1")
+    ctx.set_control_flag("visual_video_include_audio", "0")
+
+    if preset == "image-first":
+        ctx.set_control_flag("visual_mode", "url")
+        ctx.set_control_flag("visual_url_provider", "pollinations")
+        ctx.set_control_flag("visual_fallback_provider", "pollinations")
+        ctx.set_control_flag("visual_video_provider", "pollinations")
+        # Keep user's previous video model unless empty.
+        if not str(ctx.get_control_flags().get("visual_video_model", "")).strip():
+            ctx.set_control_flag("visual_video_model", "LTX-2")
+
+    elif preset == "video-first":
+        ctx.set_control_flag("visual_mode", "video")
+        ctx.set_control_flag("visual_url_provider", "pollinations")
+        ctx.set_control_flag("visual_fallback_provider", "pollinations")
+        ctx.set_control_flag("visual_video_provider", "pollinations")
+        if not str(ctx.get_control_flags().get("visual_video_model", "")).strip():
+            ctx.set_control_flag("visual_video_model", "LTX-2")
+
+    else:  # safe-fallback
+        ctx.set_control_flag("visual_mode", "auto")
+        ctx.set_control_flag("visual_url_provider", "pollinations")
+        ctx.set_control_flag("visual_fallback_provider", "ascii")
+        ctx.set_control_flag("visual_video_provider", "pollinations")
+        # In safe mode avoid ambiguous model and keep simple fast default.
+        ctx.set_control_flag("visual_video_model", "fast")
+
+    return {
+        "ok": True,
+        "preset": preset,
+        "control_flags": ctx.get_control_flags(),
+        "visual_status": ctx.fetch_visual_status(limit=10),
+    }
+
+
 @app.post("/api/visual/test")
 def api_visual_test(
     body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
@@ -1950,6 +2044,7 @@ def api_visual_test(
     audio_format = str(body.get("audio_format", "")).strip().lower()
     audio_duration_raw = str(body.get("audio_duration", "")).strip()
     audio_instrumental = body.get("audio_instrumental", None)
+    include_audio_raw = body.get("include_audio", None)
     phase = str(body.get("phase", "emergence")).strip().lower() or "emergence"
     try:
         day = int(body.get("day", 1))
@@ -1968,6 +2063,13 @@ def api_visual_test(
     audio_instrumental_bool: bool | None = None
     if audio_instrumental is not None:
         audio_instrumental_bool = _to_bool(audio_instrumental, default=False)
+    include_audio: bool | None = None
+    if include_audio_raw is not None:
+        include_audio = _to_bool(include_audio_raw, default=False)
+    elif mode == "audio":
+        include_audio = True
+    elif mode == "video":
+        include_audio = False
     return ctx.test_visual_generation(
         prompt=prompt or "mu glitch consciousness",
         mode=mode,
@@ -1980,7 +2082,40 @@ def api_visual_test(
         audio_format=audio_format,
         audio_duration=audio_duration,
         audio_instrumental=audio_instrumental_bool,
+        include_audio=include_audio,
     )
+
+
+@app.post("/api/visual/test_all")
+def api_visual_test_all(
+    body: dict = Body(default={}), ctx: AdminContext = Depends(verify_auth)
+):
+    prompt = str(body.get("prompt", "")).strip() or "mu glitch consciousness"
+    phase = str(body.get("phase", "emergence")).strip().lower() or "emergence"
+    try:
+        day = int(body.get("day", 1))
+    except (TypeError, ValueError):
+        day = 1
+    include_video_audio = _to_bool(body.get("include_video_audio", False), default=False)
+
+    results: dict[str, Any] = {}
+    for mode in ("url", "ascii", "audio", "video"):
+        results[mode] = ctx.test_visual_generation(
+            prompt=prompt,
+            mode=mode,
+            phase=phase,
+            day=max(1, day),
+            include_audio=(True if mode == "audio" else include_video_audio if mode == "video" else None),
+        )
+
+    return {
+        "ok": True,
+        "prompt": prompt,
+        "phase": phase,
+        "day": max(1, day),
+        "include_video_audio": include_video_audio,
+        "results": results,
+    }
 
 
 @app.post("/api/control/nft")

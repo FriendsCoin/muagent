@@ -157,5 +157,70 @@ Examples:
 .\trickster-agent\deploy\ops.ps1 -Action restart
 .\trickster-agent\deploy\ops.ps1 -Action rotate-moltbook-key
 .\trickster-agent\deploy\ops.ps1 -Action dashboard
+.\trickster-agent\deploy\ops.ps1 -Action quiet-on
+.\trickster-agent\deploy\ops.ps1 -Action quiet-off
+.\trickster-agent\deploy\ops.ps1 -Action writes-on
+.\trickster-agent\deploy\ops.ps1 -Action writes-off
+.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu mirror fracture"
+.\trickster-agent\deploy\ops.ps1 -Action visual-image-first
+.\trickster-agent\deploy\ops.ps1 -Action visual-video-first
+.\trickster-agent\deploy\ops.ps1 -Action visual-safe-fallback
 ```
 
+## 10) Anti-spam + visual smoke test
+
+Use quiet mode when account is sensitive / near limits:
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action quiet-on
+```
+
+Disable quiet mode:
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action quiet-off
+```
+
+Hard-disable real Moltbook writes (safe simulation mode):
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action writes-off
+```
+
+Re-enable real writes:
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action writes-on
+```
+
+Smoke-test all visual modes in one run (`url/ascii/audio/video`):
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu glitch void mirror"
+```
+
+By default video test runs without audio narration. Enable it explicitly:
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu glitch void mirror" -IncludeVideoAudio
+```
+
+## 11) Visual presets (one-click profiles)
+
+Image-first (stable image links):
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action visual-image-first
+```
+
+Video-first (prefer video model, no auto-audio):
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action visual-video-first
+```
+
+Safe-fallback (auto mode + ascii fallback):
+
+```powershell
+.\trickster-agent\deploy\ops.ps1 -Action visual-safe-fallback
+```
