@@ -5,6 +5,7 @@ param(
   [string] $Phase = "emergence",
   [int] $Day = 1,
   [switch] $IncludeVideoAudio,
+  [string] $Modes = "",
   [string] $OutFile = ""
 )
 
@@ -61,6 +62,7 @@ $res = Invoke-JsonPost `
     phase = $Phase
     day = $Day
     include_video_audio = [bool]$IncludeVideoAudio
+    modes = $Modes
   }
 
 if (-not $res.ok) {
@@ -68,7 +70,11 @@ if (-not $res.ok) {
 }
 
 $rows = @()
-foreach ($mode in @("url", "ascii", "audio", "video")) {
+$modeList = @("url", "ascii", "audio", "video")
+if ($res.modes) {
+  try { $modeList = @($res.modes | ForEach-Object { [string]$_ }) } catch {}
+}
+foreach ($mode in $modeList) {
   $item = $res.results.$mode
   if ($null -eq $item) {
     $rows += [pscustomobject]@{

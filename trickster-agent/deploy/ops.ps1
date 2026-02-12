@@ -25,7 +25,8 @@ param(
   [switch] $PromptKey,
   [string] $Prompt = "mu glitch void mirror",
   [string] $AdminToken = "",
-  [switch] $IncludeVideoAudio
+  [switch] $IncludeVideoAudio,
+  [string] $Modes = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,6 +69,7 @@ function Show-Help {
   Write-Host "  .\trickster-agent\deploy\ops.ps1 -Action set-key -KeyName MOLTBOOK_API_KEY -PromptKey"
   Write-Host "  .\trickster-agent\deploy\ops.ps1 -Action quiet-on"
   Write-Host "  .\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt `"mu mirror fracture`""
+  Write-Host "  .\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt `"mu mirror fracture`" -Modes `"video`""
   Write-Host "  .\trickster-agent\deploy\ops.ps1 -Action visual-safe-fallback"
 }
 
@@ -256,9 +258,9 @@ echo "moltbook_write_enabled=0"
       throw "Missing script: $scriptPath"
     }
     if ($IncludeVideoAudio) {
-      & $scriptPath -Prompt $Prompt -AdminToken $AdminToken -IncludeVideoAudio
+      & $scriptPath -Prompt $Prompt -AdminToken $AdminToken -IncludeVideoAudio -Modes $Modes
     } else {
-      & $scriptPath -Prompt $Prompt -AdminToken $AdminToken
+      & $scriptPath -Prompt $Prompt -AdminToken $AdminToken -Modes $Modes
     }
     break
   }
@@ -294,7 +296,7 @@ INSERT INTO control_flags(key,value,updated_at) VALUES
 ('visual_url_provider','pollinations',datetime('now')),
 ('visual_fallback_provider','pollinations',datetime('now')),
 ('visual_video_provider','pollinations',datetime('now')),
-('visual_video_model','LTX-2',datetime('now')),
+('visual_video_model','seedance-pro',datetime('now')),
 ('visual_video_include_audio','0',datetime('now'))
 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
 "
@@ -315,7 +317,7 @@ INSERT INTO control_flags(key,value,updated_at) VALUES
 ('visual_url_provider','pollinations',datetime('now')),
 ('visual_fallback_provider','ascii',datetime('now')),
 ('visual_video_provider','pollinations',datetime('now')),
-('visual_video_model','fast',datetime('now')),
+('visual_video_model','seedance-pro',datetime('now')),
 ('visual_video_include_audio','0',datetime('now'))
 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
 "

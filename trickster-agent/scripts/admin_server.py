@@ -28,6 +28,7 @@ import sys
 import time
 import uuid
 import base64
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Query, Body, Request, Depends, Header
@@ -99,6 +100,97 @@ def _to_bool(value: Any, default: bool = False) -> bool:
         if low in {"0", "false", "no", "n", "off"}:
             return False
     return default
+
+
+_REDACTED = "<redacted>"
+
+
+def _redact_query_param(url: str, param: str) -> str:
+    """Redact sensitive query params (e.g. key=) before sending JSON to browsers."""
+    raw = str(url or "")
+    if not raw or "?" not in raw:
+        return raw
+    # Keep it simple: redact param value without trying to fully re-encode the URL.
+    return re.sub(rf"([?&]{re.escape(param)}=)[^&#]*", rf"\\1{_REDACTED}", raw, flags=re.IGNORECASE)
+
+
+def _sanitize_meta(meta: Any) -> dict[str, Any]:
+    """Remove/Redact secrets from provider metadata before returning over /api/*."""
+    if not isinstance(meta, dict):
+        return {}
+    safe: dict[str, Any] = {}
+    for k, v in meta.items():
+        key = str(k)
+        # Never expose signed URLs with embedded keys to the browser.
+        if key in {"signed_url"}:
+            continue
+        if isinstance(v, str):
+            safe[key] = _redact_query_param(v, "key")
+        else:
+            safe[key] = v
+    return safe
+
+
+def _sanitize_visual_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    out = dict(payload)
+    if "url" in out:
+        out["url"] = _redact_query_param(str(out.get("url") or ""), "key")
+    out["meta"] = _sanitize_meta(out.get("meta"))
+    return out
+
+
+def _probe_media_url(public_url: str, *, signed_url: str = "", timeout_seconds: float = 8.0) -> dict[str, Any]:
+    """Best-effort check that a media URL resolves (avoid false negatives from HEAD-only probing)."""
+
+    def _ok_status(status: int) -> bool:
+        return 200 <= status < 400
+
+    def _looks_like_media(content_type: str) -> bool:
+        ct = (content_type or "").split(";", 1)[0].strip().lower()
+        if not ct:
+            return True  # Some CDNs omit CT on HEAD; allow if status is OK.
+        # Pollinations errors are JSON; treat that as non-media for our purposes.
+        if ct == "application/json":
+            return False
+        return True
+
+    def _probe_one(url: str) -> dict[str, Any]:
+        if not str(url or "").startswith("http"):
+            return {"ok": False, "method": "", "status_code": 0, "content_type": "", "error": "invalid_url"}
+        try:
+            import httpx
+
+            # 1) HEAD (fast path)
+            h = httpx.head(url, timeout=timeout_seconds, follow_redirects=True)
+            ct = str(h.headers.get("content-type", ""))
+            if _ok_status(h.status_code) and _looks_like_media(ct):
+                return {"ok": True, "method": "HEAD", "status_code": h.status_code, "content_type": ct, "error": ""}
+
+            # 2) GET with Range (avoid downloading large bodies)
+            headers = {"Range": "bytes=0-0"}
+            with httpx.stream("GET", url, headers=headers, timeout=timeout_seconds, follow_redirects=True) as g:
+                ct2 = str(g.headers.get("content-type", ""))
+                ok = _ok_status(g.status_code) and _looks_like_media(ct2)
+                return {"ok": ok, "method": "GET", "status_code": g.status_code, "content_type": ct2, "error": ""}
+        except Exception as exc:
+            return {"ok": False, "method": "", "status_code": 0, "content_type": "", "error": str(exc)[:160]}
+
+    public = _probe_one(public_url)
+    signed = _probe_one(signed_url) if (signed_url and signed_url != public_url) else {}
+    used = ""
+    if public.get("ok"):
+        used = "public"
+    elif signed.get("ok"):
+        used = "signed"
+    return {
+        "ok": bool(public.get("ok") or signed.get("ok")),
+        "used": used,
+        "requires_key": bool(used == "signed" and not public.get("ok")),
+        "public": public,
+        "signed": signed if signed else {},
+    }
 
 
 def _tail_lines(path: Path, max_lines: int = 200) -> list[str]:
@@ -914,9 +1006,9 @@ class AdminContext:
             "kind": visual.kind,
             "provider": visual.provider,
             "prompt": visual.prompt,
-            "url": visual.url,
+            "url": _redact_query_param(visual.url, "key"),
             "ascii_art": visual.ascii_art,
-            "meta": visual.meta,
+            "meta": _sanitize_meta(visual.meta),
             "phase": phase,
             "day": day,
             "mode": mode,
@@ -953,7 +1045,7 @@ class AdminContext:
         vp = str(video_provider or effective.get("video_provider") or "").strip().lower()
 
         base_force = "url" if mode == "audio" else "video"
-        base_visual = generator.generate(
+        base_visual_candidate = generator.generate(
             theme=prompt[:80] or "mystery",
             mood="soft_ominous",
             phase=phase or "emergence",
@@ -977,43 +1069,48 @@ class AdminContext:
             runware_max_attempts_override=effective.get("runware_max_attempts_override"),
         )
 
-        # Pollinations video is not always available. If the generated URL 404s,
-        # fall back to a standard image URL so the pipeline still works.
-        if base_force == "video" and base_visual.url.startswith("http"):
-            try:
-                import httpx
+        base_visual = base_visual_candidate
+        video_probe: dict[str, Any] = {}
 
-                resp = httpx.head(base_visual.url, timeout=8, follow_redirects=True)
-                if resp.status_code >= 400:
-                    base_visual = generator.generate(
-                        theme=prompt[:80] or "mystery",
-                        mood="soft_ominous",
-                        phase=phase or "emergence",
-                        day=max(1, int(day)),
-                        context=prompt,
-                        force_mode="url",
-                        enabled_override=effective["enabled"],
-                        attach_probability_override=1.0,
-                        url_provider_override=str(effective["url_provider"] or ""),
-                        url_model_override=str(effective.get("image_model") or ""),
-                        fallback_provider_override=str(effective.get("fallback_provider") or ""),
-                        video_provider_override=vp,
-                        video_model_override=video_model or str(effective.get("video_model") or ""),
-                        audio_model_override=audio_model or str(effective.get("audio_model") or ""),
-                        audio_voice_override=audio_voice or str(effective.get("audio_voice") or ""),
-                        audio_format_override=audio_format or str(effective.get("audio_format") or ""),
-                        audio_duration_override=audio_duration if audio_duration is not None else effective.get("audio_duration"),
-                        audio_instrumental_override=(
-                            audio_instrumental if audio_instrumental is not None else effective.get("audio_instrumental")
-                        ),
-                        runware_max_attempts_override=effective.get("runware_max_attempts_override"),
-                    )
-                    base_visual.meta = dict(base_visual.meta or {})
-                    base_visual.meta["video_fallback_used"] = True
-                    base_visual.meta["video_error_reason"] = f"http_{resp.status_code}"
-            except Exception:
-                # Best-effort only; keep original base_visual if probing fails.
-                pass
+        # Pollinations video is not always available. Avoid HEAD-only false negatives and don't leak signed URLs.
+        if base_force == "video" and str(base_visual_candidate.url or "").startswith("http"):
+            signed_url = str((base_visual_candidate.meta or {}).get("signed_url", "")).strip()
+            video_probe = _probe_media_url(
+                str(base_visual_candidate.url), signed_url=signed_url, timeout_seconds=8.0
+            )
+            key_in_url = bool((base_visual_candidate.meta or {}).get("key_in_url"))
+            ok_for_post = bool(video_probe.get("ok") and (video_probe.get("used") == "public" or key_in_url))
+            if not ok_for_post:
+                base_visual = generator.generate(
+                    theme=prompt[:80] or "mystery",
+                    mood="soft_ominous",
+                    phase=phase or "emergence",
+                    day=max(1, int(day)),
+                    context=prompt,
+                    force_mode="url",
+                    enabled_override=effective["enabled"],
+                    attach_probability_override=1.0,
+                    url_provider_override=str(effective["url_provider"] or ""),
+                    url_model_override=str(effective.get("image_model") or ""),
+                    fallback_provider_override=str(effective.get("fallback_provider") or ""),
+                    video_provider_override=vp,
+                    video_model_override=video_model or str(effective.get("video_model") or ""),
+                    audio_model_override=audio_model or str(effective.get("audio_model") or ""),
+                    audio_voice_override=audio_voice or str(effective.get("audio_voice") or ""),
+                    audio_format_override=audio_format or str(effective.get("audio_format") or ""),
+                    audio_duration_override=audio_duration if audio_duration is not None else effective.get("audio_duration"),
+                    audio_instrumental_override=(
+                        audio_instrumental if audio_instrumental is not None else effective.get("audio_instrumental")
+                    ),
+                    runware_max_attempts_override=effective.get("runware_max_attempts_override"),
+                )
+                base_visual.meta = dict(base_visual.meta or {})
+                base_visual.meta["video_fallback_used"] = True
+                if video_probe.get("requires_key"):
+                    base_visual.meta["video_error_reason"] = "requires_api_key"
+                else:
+                    status = (video_probe.get("public") or {}).get("status_code") or 0
+                    base_visual.meta["video_error_reason"] = f"http_{int(status) if status else 0}"
 
         image_bytes: bytes | None = None
         image_media_type = "image/jpeg"
@@ -1052,9 +1149,21 @@ class AdminContext:
                 "kind": audio.kind,
                 "provider": audio.provider,
                 "prompt": audio.prompt,
-                "url": audio.url,
-                "meta": audio.meta,
+                "url": _redact_query_param(audio.url, "key"),
+                "meta": _sanitize_meta(audio.meta),
             }
+
+        candidate_visual: dict[str, Any] | None = None
+        if base_force == "video":
+            candidate_visual = _sanitize_visual_payload(
+                {
+                    "kind": base_visual_candidate.kind,
+                    "provider": base_visual_candidate.provider,
+                    "prompt": base_visual_candidate.prompt,
+                    "url": base_visual_candidate.url,
+                    "meta": base_visual_candidate.meta,
+                }
+            )
 
         return {
             "mode": mode,
@@ -1065,9 +1174,11 @@ class AdminContext:
                 "kind": base_visual.kind,
                 "provider": base_visual.provider,
                 "prompt": base_visual.prompt,
-                "url": base_visual.url,
-                "meta": base_visual.meta,
+                "url": _redact_query_param(base_visual.url, "key"),
+                "meta": _sanitize_meta(base_visual.meta),
             },
+            "video_candidate": candidate_visual,
+            "video_probe": video_probe,
             "narration": narration,
             "audio": audio_payload,
         }
@@ -2005,7 +2116,7 @@ def api_control_visual_preset(
         ctx.set_control_flag("visual_video_provider", "pollinations")
         # Keep user's previous video model unless empty.
         if not str(ctx.get_control_flags().get("visual_video_model", "")).strip():
-            ctx.set_control_flag("visual_video_model", "LTX-2")
+            ctx.set_control_flag("visual_video_model", "seedance-pro")
 
     elif preset == "video-first":
         ctx.set_control_flag("visual_mode", "video")
@@ -2013,15 +2124,15 @@ def api_control_visual_preset(
         ctx.set_control_flag("visual_fallback_provider", "pollinations")
         ctx.set_control_flag("visual_video_provider", "pollinations")
         if not str(ctx.get_control_flags().get("visual_video_model", "")).strip():
-            ctx.set_control_flag("visual_video_model", "LTX-2")
+            ctx.set_control_flag("visual_video_model", "seedance-pro")
 
     else:  # safe-fallback
         ctx.set_control_flag("visual_mode", "auto")
         ctx.set_control_flag("visual_url_provider", "pollinations")
         ctx.set_control_flag("visual_fallback_provider", "ascii")
         ctx.set_control_flag("visual_video_provider", "pollinations")
-        # In safe mode avoid ambiguous model and keep simple fast default.
-        ctx.set_control_flag("visual_video_model", "fast")
+        # In safe mode keep a known model name (may still be gated by an API key).
+        ctx.set_control_flag("visual_video_model", "seedance-pro")
 
     return {
         "ok": True,
@@ -2097,9 +2208,22 @@ def api_visual_test_all(
     except (TypeError, ValueError):
         day = 1
     include_video_audio = _to_bool(body.get("include_video_audio", False), default=False)
+    modes_raw = body.get("modes", None)
+    allowed_modes = {"url", "ascii", "audio", "video"}
+    modes: list[str] = ["url", "ascii", "audio", "video"]
+    if modes_raw is not None:
+        parsed: list[str] = []
+        if isinstance(modes_raw, str):
+            parsed = [m.strip().lower() for m in modes_raw.split(",") if m.strip()]
+        elif isinstance(modes_raw, list):
+            parsed = [str(m).strip().lower() for m in modes_raw if str(m).strip()]
+        parsed = [m for m in parsed if m in allowed_modes]
+        if parsed:
+            # Keep stable ordering.
+            modes = [m for m in ["url", "ascii", "audio", "video"] if m in set(parsed)]
 
     results: dict[str, Any] = {}
-    for mode in ("url", "ascii", "audio", "video"):
+    for mode in modes:
         results[mode] = ctx.test_visual_generation(
             prompt=prompt,
             mode=mode,
@@ -2114,6 +2238,7 @@ def api_visual_test_all(
         "phase": phase,
         "day": max(1, day),
         "include_video_audio": include_video_audio,
+        "modes": modes,
         "results": results,
     }
 

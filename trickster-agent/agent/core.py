@@ -50,6 +50,21 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _parse_iso(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    raw = ts.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 def _flag_to_bool(value: str) -> bool | None:
     text = str(value or "").strip().lower()
     if text in {"1", "true", "yes", "on"}:
@@ -72,6 +87,55 @@ def _guess_image_media_type(data: bytes) -> str:
     if data.startswith(b"\xff\xd8"):
         return "image/jpeg"
     return "image/jpeg"
+
+
+def _probe_media_url(public_url: str, *, signed_url: str = "", timeout_seconds: float = 8.0) -> dict[str, Any]:
+    """Best-effort check that a media URL resolves (avoid false negatives from HEAD-only probing)."""
+
+    def _ok_status(status: int) -> bool:
+        return 200 <= status < 400
+
+    def _looks_like_media(content_type: str) -> bool:
+        ct = (content_type or "").split(";", 1)[0].strip().lower()
+        if not ct:
+            return True
+        if ct == "application/json":
+            return False
+        return True
+
+    def _probe_one(url: str) -> dict[str, Any]:
+        if not str(url or "").startswith("http"):
+            return {"ok": False, "method": "", "status_code": 0, "content_type": "", "error": "invalid_url"}
+        try:
+            import httpx
+
+            h = httpx.head(url, timeout=timeout_seconds, follow_redirects=True)
+            ct = str(h.headers.get("content-type", ""))
+            if _ok_status(h.status_code) and _looks_like_media(ct):
+                return {"ok": True, "method": "HEAD", "status_code": h.status_code, "content_type": ct, "error": ""}
+
+            headers = {"Range": "bytes=0-0"}
+            with httpx.stream("GET", url, headers=headers, timeout=timeout_seconds, follow_redirects=True) as g:
+                ct2 = str(g.headers.get("content-type", ""))
+                ok = _ok_status(g.status_code) and _looks_like_media(ct2)
+                return {"ok": ok, "method": "GET", "status_code": g.status_code, "content_type": ct2, "error": ""}
+        except Exception as exc:
+            return {"ok": False, "method": "", "status_code": 0, "content_type": "", "error": str(exc)[:160]}
+
+    public = _probe_one(public_url)
+    signed = _probe_one(signed_url) if (signed_url and signed_url != public_url) else {}
+    used = ""
+    if public.get("ok"):
+        used = "public"
+    elif signed.get("ok"):
+        used = "signed"
+    return {
+        "ok": bool(public.get("ok") or signed.get("ok")),
+        "used": used,
+        "requires_key": bool(used == "signed" and not public.get("ok")),
+        "public": public,
+        "signed": signed if signed else {},
+    }
 
 
 def _dedupe_keep_order(items: list[str]) -> list[str]:
@@ -204,6 +268,46 @@ class MuAgent:
                         },
                     }
                     logger.info("Pause flag is active: action overridden to silence")
+
+                quiet_flag = (await db.get_control_flag("quiet_mode", "0")).strip().lower()
+                if quiet_flag in {"1", "true", "yes", "on"} and action.type in {"post", "comment", "upvote"}:
+                    previous_action = action
+                    quiet_reason = "Quiet mode: write action suppressed"
+                    should_suppress = True
+                    if action.type == "comment":
+                        cooldown_raw = (await db.get_control_flag("quiet_comment_cooldown_hours", "6")).strip()
+                        try:
+                            cooldown_hours = max(1.0, min(48.0, float(cooldown_raw or "6")))
+                        except ValueError:
+                            cooldown_hours = 6.0
+                        last_comment_dt = _parse_iso(state.last_comment_time)
+                        if last_comment_dt is None:
+                            should_suppress = False
+                        else:
+                            elapsed_hours = (datetime.now(timezone.utc) - last_comment_dt).total_seconds() / 3600.0
+                            if elapsed_hours >= cooldown_hours:
+                                should_suppress = False
+                            else:
+                                quiet_reason = (
+                                    f"Quiet mode: comment cooldown ({cooldown_hours:.1f}h) not elapsed yet"
+                                )
+
+                    if should_suppress:
+                        action = Action(
+                            type="silence",
+                            score=1.0,
+                            reason=quiet_reason,
+                        )
+                        action.trace = {
+                            "decision_path": "control_flag_quiet_mode",
+                            "quiet_mode": True,
+                            "previous_selected": {
+                                "type": previous_action.type,
+                                "reason": previous_action.reason,
+                                "score": previous_action.score,
+                            },
+                        }
+                        logger.info("Quiet mode is active: action overridden to silence (%s)", previous_action.type)
 
                 result = await self._act(action, state, mb, db, context)
 
@@ -373,12 +477,14 @@ class MuAgent:
         visual_audio_format_flag = (await db.get_control_flag("visual_audio_format", "")).strip()
         visual_audio_duration_raw = (await db.get_control_flag("visual_audio_duration", "")).strip()
         visual_audio_instrumental_raw = (await db.get_control_flag("visual_audio_instrumental", "")).strip()
+        visual_video_include_audio_raw = (await db.get_control_flag("visual_video_include_audio", "")).strip()
         visual_runware_attempts_raw = (await db.get_control_flag("visual_runware_max_attempts", "")).strip()
         visual_attach_prob_raw = (await db.get_control_flag("visual_attach_probability", "")).strip()
         visual_attach_prob_override: float | None = None
         visual_runware_attempts_override: int | None = None
         visual_audio_duration_override: int | None = None
         visual_audio_instrumental_override: bool | None = None
+        visual_video_include_audio: bool | None = None
         if visual_attach_prob_raw:
             try:
                 parsed = float(visual_attach_prob_raw)
@@ -402,6 +508,15 @@ class MuAgent:
                 visual_audio_instrumental_override = True
             elif low in {"0", "false", "no", "off"}:
                 visual_audio_instrumental_override = False
+        if visual_video_include_audio_raw:
+            low = visual_video_include_audio_raw.strip().lower()
+            if low in {"1", "true", "yes", "on"}:
+                visual_video_include_audio = True
+            elif low in {"0", "false", "no", "off"}:
+                visual_video_include_audio = False
+        if visual_video_include_audio is None:
+            media_cfg = self._cfg.get("visual_posting", {}).get("media", {})
+            visual_video_include_audio = bool(media_cfg.get("video_include_audio", False))
 
         instruction_low = (action.operator_instruction or "").lower()
         force_visual_mode = ""
@@ -467,7 +582,9 @@ class MuAgent:
         media_requested = force_visual_mode in {"audio", "video"} or requested_media_type in {"audio", "video"}
         media_audio_url = ""
         if media_requested:
-            base_force = "url" if (force_visual_mode == "audio" or requested_media_type == "audio") else "video"
+            is_audio_mode = force_visual_mode == "audio" or requested_media_type == "audio"
+            is_video_mode = force_visual_mode == "video" or requested_media_type == "video"
+            base_force = "url" if is_audio_mode else "video"
             base_visual = self._visual.generate(
                 theme=action.theme,
                 mood=action.visual_mood,
@@ -493,10 +610,11 @@ class MuAgent:
             # Pollinations video is not always available. If video URL errors, fall back to image.
             if base_force == "video" and base_visual.url.startswith("http"):
                 try:
-                    import httpx
-
-                    resp = httpx.head(base_visual.url, timeout=8, follow_redirects=True)
-                    if resp.status_code >= 400:
+                    signed_url = str((base_visual.meta or {}).get("signed_url", "")).strip()
+                    probe = _probe_media_url(base_visual.url, signed_url=signed_url, timeout_seconds=8.0)
+                    key_in_url = bool((base_visual.meta or {}).get("key_in_url"))
+                    ok_for_post = bool(probe.get("ok") and (probe.get("used") == "public" or key_in_url))
+                    if not ok_for_post:
                         base_visual = self._visual.generate(
                             theme=action.theme,
                             mood=action.visual_mood,
@@ -520,7 +638,11 @@ class MuAgent:
                         )
                         base_visual.meta = dict(base_visual.meta or {})
                         base_visual.meta["video_fallback_used"] = True
-                        base_visual.meta["video_error_reason"] = f"http_{resp.status_code}"
+                        if probe.get("requires_key"):
+                            base_visual.meta["video_error_reason"] = "requires_api_key"
+                        else:
+                            status = (probe.get("public") or {}).get("status_code") or 0
+                            base_visual.meta["video_error_reason"] = f"http_{int(status) if status else 0}"
                 except Exception:
                     pass
 
@@ -537,23 +659,25 @@ class MuAgent:
                 except Exception:
                     image_bytes = None
 
-            narration = self._personality.generate_media_narration(
-                visual_prompt=base_visual.prompt or visual.prompt or action.theme,
-                phase=state.current_phase,
-                day=state.current_day,
-                image_bytes=image_bytes,
-                image_media_type=image_media_type,
-                total_posts=state.total_posts,
-            )
-            audio = self._visual.tts_from_text(
-                narration,
-                voice_override=visual_audio_voice_flag,
-                model_override=visual_audio_model_flag,
-                format_override=visual_audio_format_flag,
-                duration_override=visual_audio_duration_override,
-                instrumental_override=visual_audio_instrumental_override,
-            )
-            media_audio_url = str(audio.url or "").strip()
+            should_generate_audio = is_audio_mode or (is_video_mode and bool(visual_video_include_audio))
+            if should_generate_audio:
+                narration = self._personality.generate_media_narration(
+                    visual_prompt=base_visual.prompt or visual.prompt or action.theme,
+                    phase=state.current_phase,
+                    day=state.current_day,
+                    image_bytes=image_bytes,
+                    image_media_type=image_media_type,
+                    total_posts=state.total_posts,
+                )
+                audio = self._visual.tts_from_text(
+                    narration,
+                    voice_override=visual_audio_voice_flag,
+                    model_override=visual_audio_model_flag,
+                    format_override=visual_audio_format_flag,
+                    duration_override=visual_audio_duration_override,
+                    instrumental_override=visual_audio_instrumental_override,
+                )
+                media_audio_url = str(audio.url or "").strip()
 
             # Swap: keep the base visual as the post URL; add the audio narration link to the content.
             visual = base_visual

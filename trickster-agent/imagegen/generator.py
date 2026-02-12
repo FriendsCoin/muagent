@@ -279,10 +279,26 @@ class VisualGenerator:
         seed = int(seed_base[:8], 16)
         encoded = quote(prompt_clean, safe="")
         # Pollinations serves video via the /image/{prompt} endpoint when a video-capable model is selected.
-        public_url = (
-            f"{self._pollinations_media_endpoint}/image/{encoded}"
-            f"?model={quote_plus(model)}&seed={seed}"
-        )
+        # Keep query params aligned with their public examples to reduce 4xx surprises.
+        w = 0
+        h = 0
+        try:
+            w = int(self._media_cfg.get("video_width") or self._url_cfg.get("width") or 0)
+        except (TypeError, ValueError):
+            w = 0
+        try:
+            h = int(self._media_cfg.get("video_height") or self._url_cfg.get("height") or 0)
+        except (TypeError, ValueError):
+            h = 0
+
+        enhance = bool(self._media_cfg.get("video_enhance", False))
+        query_parts: list[str] = [f"model={quote_plus(model)}", f"seed={seed}", f"enhance={'true' if enhance else 'false'}"]
+        if w > 0:
+            query_parts.append(f"width={w}")
+        if h > 0:
+            query_parts.append(f"height={h}")
+
+        public_url = f"{self._pollinations_media_endpoint}/image/{encoded}?" + "&".join(query_parts)
         signed_url = public_url + self._pollinations_key_query()
         url = signed_url if (self._media_public_include_key and self._pollinations_key_query()) else public_url
         return VisualAttachment(
@@ -293,6 +309,9 @@ class VisualGenerator:
             meta={
                 "media_type": "video",
                 "model": model,
+                "width": w if w > 0 else None,
+                "height": h if h > 0 else None,
+                "enhance": enhance,
                 "public_url": public_url,
                 "signed_url": signed_url if self._pollinations_key_query() else "",
                 "key_in_url": bool(self._media_public_include_key and self._pollinations_key_query()),

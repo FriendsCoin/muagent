@@ -196,13 +196,23 @@ Re-enable real writes:
 Smoke-test all visual modes in one run (`url/ascii/audio/video`):
 
 ```powershell
-.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu glitch void mirror"
+.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu glitch void mirror" -AdminToken "YOUR_ADMIN_TOKEN"
 ```
 
 By default video test runs without audio narration. Enable it explicitly:
 
 ```powershell
-.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu glitch void mirror" -IncludeVideoAudio
+.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu glitch void mirror" -AdminToken "YOUR_ADMIN_TOKEN" -IncludeVideoAudio
+```
+
+Run only specific modes (avoid spending tokens on narration/tts):
+
+```powershell
+# video only (no audio mode at all)
+.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu mirror fracture" -AdminToken "YOUR_ADMIN_TOKEN" -Modes "video"
+
+# url + ascii only
+.\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu mirror fracture" -AdminToken "YOUR_ADMIN_TOKEN" -Modes "url,ascii"
 ```
 
 ## 11) Visual presets (one-click profiles)
@@ -224,3 +234,7 @@ Safe-fallback (auto mode + ascii fallback):
 ```powershell
 .\trickster-agent\deploy\ops.ps1 -Action visual-safe-fallback
 ```
+
+Notes:
+- Video via Pollinations is experimental. Many models require an API key; the bot will fall back to an image URL if the video link is not publicly accessible.
+- Audio narration uses the LLM (tokens) because it generates a description; use `-Modes "url,ascii,video"` to test without narration.
