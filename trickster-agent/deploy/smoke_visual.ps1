@@ -106,6 +106,14 @@ foreach ($mode in $modeList) {
   $note = ""
   if ($mode -eq "video") {
     $note = "include_audio=$([bool]$item.include_audio)"
+    try {
+      $reason = [string]$item.base_visual.meta.video_error_reason
+      if ($reason) { $note = "$note; reason=$reason" }
+    } catch {}
+    try {
+      $used = [string]$item.video_probe.used
+      if ($used) { $note = "$note; probe=$used" }
+    } catch {}
   }
 
   $rows += [pscustomobject]@{
