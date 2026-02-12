@@ -4,6 +4,18 @@ This repo is split into:
 - Server side (Ubuntu/Hetzner): runs the agent + admin API as systemd services
 - Local side (Windows): runs the React dashboard and connects via SSH tunnel
 
+## Quick entry points
+
+- Unified runbook: `deploy/OPS_RUNBOOK.md`
+- Unified helper script (Windows): `deploy/ops.ps1`
+
+Example:
+
+```powershell
+cd E:\PROJECTS\files_molt
+.\trickster-agent\deploy\ops.ps1 -Action help
+```
+
 ## 1) One-command server bootstrap (first install)
 
 From Windows (PowerShell):
@@ -134,4 +146,3 @@ cd /opt/trickster-agent/repo/trickster-agent
 sudo -u bot -H bash -lc '.venv/bin/pip install -r requirements.txt'
 systemctl restart trickster-admin
 ```
-
