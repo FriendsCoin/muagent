@@ -338,6 +338,17 @@ def _ensure_admin_tables(db_path: Path) -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media_previews (
+                id TEXT PRIMARY KEY,
+                media_type TEXT,
+                public_url TEXT,
+                require_key INTEGER,
+                created_at TEXT
+            )
+            """
+        )
         conn.commit()
     finally:
         conn.close()
@@ -376,6 +387,31 @@ class AdminContext:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    def create_media_preview(self, *, media_type: str, public_url: str, require_key: bool) -> str:
+        preview_id = str(uuid.uuid4())
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO media_previews (id, media_type, public_url, require_key, created_at) VALUES (?, ?, ?, ?, ?)",
+                (preview_id, str(media_type), str(public_url), 1 if bool(require_key) else 0, _now_iso()),
+            )
+            # Best-effort prune: keep DB from growing forever.
+            conn.execute(
+                "DELETE FROM media_previews WHERE id NOT IN (SELECT id FROM media_previews ORDER BY created_at DESC LIMIT 200)"
+            )
+            conn.commit()
+        return preview_id
+
+    def get_media_preview(self, preview_id: str) -> dict[str, Any] | None:
+        pid = str(preview_id or "").strip()
+        if not pid:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, media_type, public_url, require_key, created_at FROM media_previews WHERE id = ? LIMIT 1",
+                (pid,),
+            ).fetchone()
+        return dict(row) if row else None
 
     def fetch_recent(self, table: str, limit: int = 20) -> list[dict]:
         if not self.db_path.exists():
@@ -1071,6 +1107,7 @@ class AdminContext:
 
         base_visual = base_visual_candidate
         video_probe: dict[str, Any] = {}
+        preview: dict[str, Any] | None = None
 
         # Pollinations video is not always available. Avoid HEAD-only false negatives and don't leak signed URLs.
         if base_force == "video" and str(base_visual_candidate.url or "").startswith("http"):
@@ -1080,6 +1117,11 @@ class AdminContext:
             )
             key_in_url = bool((base_visual_candidate.meta or {}).get("key_in_url"))
             ok_for_post = bool(video_probe.get("ok") and (video_probe.get("used") == "public" or key_in_url))
+            if video_probe.get("requires_key"):
+                public_url = str((base_visual_candidate.meta or {}).get("public_url") or base_visual_candidate.url).strip()
+                if public_url.startswith("http"):
+                    pid = self.create_media_preview(media_type="video", public_url=public_url, require_key=True)
+                    preview = {"id": pid, "url": f"/api/media/preview/{pid}", "requires_key": True}
             if not ok_for_post:
                 base_visual = generator.generate(
                     theme=prompt[:80] or "mystery",
@@ -1179,6 +1221,7 @@ class AdminContext:
             },
             "video_candidate": candidate_visual,
             "video_probe": video_probe,
+            "preview": preview,
             "narration": narration,
             "audio": audio_payload,
         }
@@ -1707,6 +1750,51 @@ def verify_auth(
     if supplied != token:
         raise HTTPException(status_code=401, detail="unauthorized")
     return ctx
+
+
+# Proxy media previews through the admin API so keys are never exposed to the browser.
+@app.get("/api/media/preview/{preview_id}")
+def api_media_preview(preview_id: str, ctx: AdminContext = Depends(verify_auth)):
+    item = ctx.get_media_preview(preview_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="not_found")
+
+    public_url = str(item.get("public_url") or "").strip()
+    if not public_url.startswith("http"):
+        raise HTTPException(status_code=400, detail="invalid_url")
+
+    parsed = urlparse(public_url)
+    if parsed.scheme not in {"http", "https"} or parsed.netloc != "gen.pollinations.ai":
+        raise HTTPException(status_code=400, detail="forbidden_host")
+    if not (parsed.path.startswith("/image/") or parsed.path.startswith("/audio/")):
+        raise HTTPException(status_code=400, detail="forbidden_path")
+
+    require_key = bool(int(item.get("require_key") or 0))
+    fetch_url = public_url
+    if require_key:
+        secrets = ctx.cfg.get("_secrets", {}) if isinstance(ctx.cfg, dict) else {}
+        key = str(secrets.get("pollinations_api_key", "")).strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="missing_pollinations_key")
+        sep = "&" if ("?" in fetch_url) else "?"
+        fetch_url = f"{fetch_url}{sep}key={key}"
+
+    try:
+        import httpx
+        from fastapi.responses import StreamingResponse
+
+        def _iter_bytes():
+            with httpx.stream("GET", fetch_url, timeout=60.0, follow_redirects=True) as r:
+                r.raise_for_status()
+                for chunk in r.iter_bytes():
+                    if chunk:
+                        yield chunk
+
+        with httpx.stream("GET", fetch_url, timeout=30.0, follow_redirects=True) as r0:
+            ct = str(r0.headers.get("content-type") or "application/octet-stream")
+        return StreamingResponse(_iter_bytes(), media_type=ct)
+    except Exception:
+        raise HTTPException(status_code=502, detail="proxy_error")
 
 
 # ── Fallback HTML admin panel ────────────────────────────────────

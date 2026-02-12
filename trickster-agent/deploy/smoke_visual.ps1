@@ -114,6 +114,10 @@ foreach ($mode in $modeList) {
       $used = [string]$item.video_probe.used
       if ($used) { $note = "$note; probe=$used" }
     } catch {}
+    try {
+      $purl = [string]$item.preview.url
+      if ($purl) { $note = "$note; preview=$purl" }
+    } catch {}
   }
 
   $rows += [pscustomobject]@{

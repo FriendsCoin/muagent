@@ -156,8 +156,9 @@ visual_posting:
     # - "pollinations": URL-based generation via GET /image/{prompt}?model=... on gen.pollinations.ai
     # - "fal": text-to-video via fal.ai queue API (recommended)
     video_provider: "pollinations"
-    # Common video models: "LTX-2", "grok-video", "veo", "seedance"
-    video_model: "fast"
+    # Common models (as of Feb 2026): "seedance-pro", "seedance", "grok-video", "ltx-2", "veo", "wan"
+    # NOTE: many models require POLLINATIONS_API_KEY.
+    video_model: "seedance-pro"
     # WARNING: if true, generated audio/video URLs may include POLLINATIONS_API_KEY in the URL.
     # Keep this false for public posts.
     public_url_include_key: false
