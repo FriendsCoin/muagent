@@ -199,6 +199,17 @@ Smoke-test all visual modes in one run (`url/ascii/audio/video`):
 .\trickster-agent\deploy\ops.ps1 -Action smoke-visual -Prompt "mu glitch void mirror" -AdminToken "YOUR_ADMIN_TOKEN"
 ```
 
+Server-side equivalent (run directly on the VPS, no tunnel):
+
+```bash
+curl -s "http://127.0.0.1:8787/api/visual/test_all" \
+  -H "X-Admin-Token: YOUR_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -X POST \
+  -d '{"prompt":"mu mirror fracture","phase":"emergence","day":7,"modes":["video"],"include_video_audio":false}' \
+  | python3 -m json.tool
+```
+
 By default video test runs without audio narration. Enable it explicitly:
 
 ```powershell
